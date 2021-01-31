@@ -4,9 +4,6 @@
 import torch
 import torch.nn as nn
 
-from .rasterizer import Fragments
-from .utils import _clip_barycentric_coordinates, _interpolate_zbuf
-
 
 # A renderer class should be initialized with a
 # function for rasterization and a function for shading.
@@ -36,6 +33,12 @@ class MeshRenderer(nn.Module):
         self.rasterizer = rasterizer
         self.shader = shader
 
+    def to(self, device):
+        # Rasterizer and shader have submodules which are not of type nn.Module
+        self.rasterizer.to(device)
+        self.shader.to(device)
+        return self
+
     def forward(self, meshes_world, **kwargs) -> torch.Tensor:
         """
         Render a batch of images from a batch of meshes by rasterizing and then
@@ -47,27 +50,52 @@ class MeshRenderer(nn.Module):
         face f, clipping is required before interpolating the texture uv
         coordinates and z buffer so that the colors and depths are limited to
         the range for the corresponding face.
+        For this set rasterizer.raster_settings.clip_barycentric_coords=True
         """
         fragments = self.rasterizer(meshes_world, **kwargs)
-        raster_settings = kwargs.get(
-            'raster_settings', self.rasterizer.raster_settings
-        )
-        if raster_settings.blur_radius > 0.0:
-            # TODO: potentially move barycentric clipping to the rasterizer
-            # if no downstream functions requires unclipped values.
-            # This will avoid unnecssary re-interpolation of the z buffer.
-            clipped_bary_coords = _clip_barycentric_coordinates(
-                fragments.bary_coords
-            )
-            clipped_zbuf = _interpolate_zbuf(
-                fragments.pix_to_face, clipped_bary_coords, meshes_world
-            )
-            fragments = Fragments(
-                bary_coords=clipped_bary_coords,
-                zbuf=clipped_zbuf,
-                dists=fragments.dists,
-                pix_to_face=fragments.pix_to_face,
-            )
         images = self.shader(fragments, meshes_world, **kwargs)
 
         return images
+
+
+class MeshRendererWithFragments(nn.Module):
+    """
+    A class for rendering a batch of heterogeneous meshes. The class should
+    be initialized with a rasterizer and shader class which each have a forward
+    function.
+
+    In the forward pass this class returns the `fragments` from which intermediate
+    values such as the depth map can be easily extracted e.g.
+
+    .. code-block:: python
+        images, fragments = renderer(meshes)
+        depth = fragments.zbuf
+    """
+
+    def __init__(self, rasterizer, shader):
+        super().__init__()
+        self.rasterizer = rasterizer
+        self.shader = shader
+
+    def to(self, device):
+        # Rasterizer and shader have submodules which are not of type nn.Module
+        self.rasterizer.to(device)
+        self.shader.to(device)
+
+    def forward(self, meshes_world, **kwargs):
+        """
+        Render a batch of images from a batch of meshes by rasterizing and then
+        shading.
+
+        NOTE: If the blur radius for rasterization is > 0.0, some pixels can
+        have one or more barycentric coordinates lying outside the range [0, 1].
+        For a pixel with out of bounds barycentric coordinates with respect to a
+        face f, clipping is required before interpolating the texture uv
+        coordinates and z buffer so that the colors and depths are limited to
+        the range for the corresponding face.
+        For this set rasterizer.raster_settings.clip_barycentric_coords=True
+        """
+        fragments = self.rasterizer(meshes_world, **kwargs)
+        images = self.shader(fragments, meshes_world, **kwargs)
+
+        return images, fragments

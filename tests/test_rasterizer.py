@@ -7,8 +7,9 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+
 from pytorch3d.renderer.cameras import (
-    OpenGLPerspectiveCameras,
+    FoVPerspectiveCameras,
     look_at_view_transform,
 )
 from pytorch3d.renderer.mesh.rasterizer import (
@@ -49,7 +50,7 @@ class TestMeshRasterizer(unittest.TestCase):
 
         # Init rasterizer settings
         R, T = look_at_view_transform(2.7, 0, 0)
-        cameras = OpenGLPerspectiveCameras(device=device, R=R, T=T)
+        cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
         raster_settings = RasterizationSettings(
             image_size=512, blur_radius=0.0, faces_per_pixel=1, bin_size=0
         )
@@ -158,7 +159,7 @@ class TestPointRasterizer(unittest.TestCase):
         verts_padded[..., 0] += 0.2
         pointclouds = Pointclouds(points=verts_padded)
         R, T = look_at_view_transform(2.7, 0.0, 0.0)
-        cameras = OpenGLPerspectiveCameras(device=device, R=R, T=T)
+        cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
         raster_settings = PointsRasterizationSettings(
             image_size=256, radius=5e-2, points_per_pixel=1
         )

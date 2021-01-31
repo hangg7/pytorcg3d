@@ -6,16 +6,24 @@ import math
 import unittest
 
 import torch
+from common_testing import TestCaseMixin
+
 from pytorch3d.transforms.rotation_conversions import (
+    axis_angle_to_matrix,
+    axis_angle_to_quaternion,
     euler_angles_to_matrix,
+    matrix_to_axis_angle,
     matrix_to_euler_angles,
     matrix_to_quaternion,
+    matrix_to_rotation_6d,
     quaternion_apply,
     quaternion_multiply,
+    quaternion_to_axis_angle,
     quaternion_to_matrix,
     random_quaternions,
     random_rotation,
     random_rotations,
+    rotation_6d_to_matrix,
 )
 
 
@@ -50,7 +58,7 @@ class TestRandomRotation(unittest.TestCase):
             )
 
 
-class TestRotationConversion(unittest.TestCase):
+class TestRotationConversion(TestCaseMixin, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         torch.manual_seed(1)
@@ -59,13 +67,13 @@ class TestRotationConversion(unittest.TestCase):
         """quat -> mtx -> quat"""
         data = random_quaternions(13, dtype=torch.float64)
         mdata = matrix_to_quaternion(quaternion_to_matrix(data))
-        self.assertTrue(torch.allclose(data, mdata))
+        self.assertClose(data, mdata)
 
     def test_to_quat(self):
         """mtx -> quat -> mtx"""
         data = random_rotations(13, dtype=torch.float64)
         mdata = quaternion_to_matrix(matrix_to_quaternion(data))
-        self.assertTrue(torch.allclose(data, mdata))
+        self.assertClose(data, mdata)
 
     def test_quat_grad_exists(self):
         """Quaternion calculations are differentiable."""
@@ -106,13 +114,13 @@ class TestRotationConversion(unittest.TestCase):
         for convention in self._tait_bryan_conventions():
             matrices = euler_angles_to_matrix(data, convention)
             mdata = matrix_to_euler_angles(matrices, convention)
-            self.assertTrue(torch.allclose(data, mdata))
+            self.assertClose(data, mdata)
 
         data[:, 1] += half_pi
         for convention in self._proper_euler_conventions():
             matrices = euler_angles_to_matrix(data, convention)
             mdata = matrix_to_euler_angles(matrices, convention)
-            self.assertTrue(torch.allclose(data, mdata))
+            self.assertClose(data, mdata)
 
     def test_to_euler(self):
         """mtx -> euler -> mtx"""
@@ -120,7 +128,7 @@ class TestRotationConversion(unittest.TestCase):
         for convention in self._all_euler_angle_conventions():
             euler_angles = matrix_to_euler_angles(data, convention)
             mdata = euler_angles_to_matrix(euler_angles, convention)
-            self.assertTrue(torch.allclose(data, mdata))
+            self.assertClose(data, mdata)
 
     def test_euler_grad_exists(self):
         """Euler angle calculations are differentiable."""
@@ -142,7 +150,46 @@ class TestRotationConversion(unittest.TestCase):
         ab_matrix = torch.matmul(a_matrix, b_matrix)
         ab_from_matrix = matrix_to_quaternion(ab_matrix)
         self.assertEqual(ab.shape, ab_from_matrix.shape)
-        self.assertTrue(torch.allclose(ab, ab_from_matrix))
+        self.assertClose(ab, ab_from_matrix)
+
+    def test_matrix_to_quaternion_corner_case(self):
+        """Check no bad gradients from sqrt(0)."""
+        matrix = torch.eye(3, requires_grad=True)
+        target = torch.Tensor([0.984808, 0, 0.174, 0])
+
+        optimizer = torch.optim.Adam([matrix], lr=0.05)
+        optimizer.zero_grad()
+        q = matrix_to_quaternion(matrix)
+        loss = torch.sum((q - target) ** 2)
+        loss.backward()
+        optimizer.step()
+
+        self.assertClose(matrix, 0.95 * torch.eye(3))
+
+    def test_from_axis_angle(self):
+        """axis_angle -> mtx -> axis_angle"""
+        n_repetitions = 20
+        data = torch.rand(n_repetitions, 3)
+        matrices = axis_angle_to_matrix(data)
+        mdata = matrix_to_axis_angle(matrices)
+        self.assertClose(data, mdata, atol=2e-6)
+
+    def test_from_axis_angle_has_grad(self):
+        n_repetitions = 20
+        data = torch.rand(n_repetitions, 3, requires_grad=True)
+        matrices = axis_angle_to_matrix(data)
+        mdata = matrix_to_axis_angle(matrices)
+        quats = axis_angle_to_quaternion(data)
+        mdata2 = quaternion_to_axis_angle(quats)
+        (grad,) = torch.autograd.grad(mdata.sum() + mdata2.sum(), data)
+        self.assertTrue(torch.isfinite(grad).all())
+
+    def test_to_axis_angle(self):
+        """mtx -> axis_angle -> mtx"""
+        data = random_rotations(13, dtype=torch.float64)
+        euler_angles = matrix_to_axis_angle(data)
+        mdata = axis_angle_to_matrix(euler_angles)
+        self.assertClose(data, mdata)
 
     def test_quaternion_application(self):
         """Applying a quaternion is the same as applying the matrix."""
@@ -151,8 +198,38 @@ class TestRotationConversion(unittest.TestCase):
         points = torch.randn(3, 3, dtype=torch.float64, requires_grad=True)
         transform1 = quaternion_apply(quaternions, points)
         transform2 = torch.matmul(matrices, points[..., None])[..., 0]
-        self.assertTrue(torch.allclose(transform1, transform2))
+        self.assertClose(transform1, transform2)
 
         [p, q] = torch.autograd.grad(transform1.sum(), [points, quaternions])
         self.assertTrue(torch.isfinite(p).all())
         self.assertTrue(torch.isfinite(q).all())
+
+    def test_6d(self):
+        """Converting to 6d and back"""
+        r = random_rotations(13, dtype=torch.float64)
+
+        # 6D representation is not unique,
+        # but we implement it by taking the first two rows of the matrix
+        r6d = matrix_to_rotation_6d(r)
+        self.assertClose(r6d, r[:, :2, :].reshape(-1, 6))
+
+        # going to 6D and back should not change the matrix
+        r_hat = rotation_6d_to_matrix(r6d)
+        self.assertClose(r_hat, r)
+
+        # moving the second row R2 in the span of (R1, R2) should not matter
+        r6d[:, 3:] += 2 * r6d[:, :3]
+        r6d[:, :3] *= 3.0
+        r_hat = rotation_6d_to_matrix(r6d)
+        self.assertClose(r_hat, r)
+
+        # check that we map anything to a valid rotation
+        r6d = torch.rand(13, 6)
+        r6d[:4, :] *= 3.0
+        r6d[4:8, :] -= 0.5
+        r = rotation_6d_to_matrix(r6d)
+        self.assertClose(
+            torch.matmul(r, r.permute(0, 2, 1)),
+            torch.eye(3).expand_as(r),
+            atol=1e-6,
+        )

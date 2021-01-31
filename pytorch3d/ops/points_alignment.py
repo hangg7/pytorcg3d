@@ -4,6 +4,7 @@ import warnings
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Union
 
 import torch
+
 from pytorch3d.ops import knn_points
 from pytorch3d.structures import utils as strutil
 

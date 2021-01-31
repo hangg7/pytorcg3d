@@ -2,7 +2,7 @@
 
 import math
 import warnings
-from typing import Optional
+from typing import List, Optional, Union
 
 import torch
 
@@ -21,7 +21,7 @@ class Transform3d:
         points = torch.randn(N, P, 3)
         normals = torch.randn(N, P, 3)
         points_transformed = t.transform_points(points)    # => (N, P, 3)
-        normals_transformed = t.transform_points(normals)  # => (N, P, 3)
+        normals_transformed = t.transform_normals(normals)  # => (N, P, 3)
 
 
     BROADCASTING
@@ -45,9 +45,9 @@ class Transform3d:
 
     .. code-block:: python
 
-        y1 = t3.transform_points(t2.transform_points(t2.transform_points(x)))
-        y2 = t1.compose(t2).compose(t3).transform_points()
-        y3 = t1.compose(t2, t3).transform_points()
+        y1 = t3.transform_points(t2.transform_points(t1.transform_points(x)))
+        y2 = t1.compose(t2).compose(t3).transform_points(x)
+        y3 = t1.compose(t2, t3).transform_points(x)
 
 
     Composing transforms should broadcast.
@@ -157,7 +157,6 @@ class Transform3d:
                 1, 4, 4
             )
         else:
-            # pyre-fixme[16]: `Tensor` has no attribute `ndim`.
             if matrix.ndim not in (2, 3):
                 raise ValueError(
                     '"matrix" has to be a 2- or a 3-dimensional tensor.'
@@ -176,6 +175,22 @@ class Transform3d:
 
     def __len__(self):
         return self.get_matrix().shape[0]
+
+    def __getitem__(
+        self, index: Union[int, List[int], slice, torch.Tensor]
+    ) -> 'Transform3d':
+        """
+        Args:
+            index: Specifying the index of the transform to retrieve.
+                Can be an int, slice, list of ints, boolean, long tensor.
+                Supports negative indices.
+
+        Returns:
+            Transform3d object with selected transforms. The tensors are not cloned.
+        """
+        if isinstance(index, int):
+            index = [index]
+        return self.__class__(matrix=self.get_matrix()[index])
 
     def compose(self, *others):
         """
@@ -368,6 +383,9 @@ class Transform3d:
     def scale(self, *args, **kwargs):
         return self.compose(Scale(device=self.device, *args, **kwargs))
 
+    def rotate(self, *args, **kwargs):
+        return self.compose(Rotate(device=self.device, *args, **kwargs))
+
     def rotate_axis_angle(self, *args, **kwargs):
         return self.compose(
             RotateAxisAngle(device=self.device, *args, **kwargs)
@@ -383,7 +401,7 @@ class Transform3d:
         """
         other = Transform3d(device=self.device)
         if self._lu is not None:
-            other._lu = [l.clone() for l in self._lu]
+            other._lu = [elem.clone() for elem in self._lu]
         other._matrix = self._matrix.clone()
         other._transforms = [t.clone() for t in self._transforms]
         return other
@@ -411,8 +429,9 @@ class Transform3d:
         if self.device != device:
             other.device = device
             other._matrix = self._matrix.to(device=device, dtype=dtype)
-            for t in other._transforms:
-                t.to(device, copy=copy, dtype=dtype)
+            other._transforms = [
+                t.to(device, copy=copy, dtype=dtype) for t in other._transforms
+            ]
         return other
 
     def cpu(self):
@@ -423,9 +442,7 @@ class Transform3d:
 
 
 class Translate(Transform3d):
-    def __init__(
-        self, x, y=None, z=None, dtype=torch.float32, device: str = 'cpu'
-    ):
+    def __init__(self, x, y=None, z=None, dtype=torch.float32, device='cpu'):
         """
         Create a new Transform3d representing 3D translations.
 
@@ -459,9 +476,7 @@ class Translate(Transform3d):
 
 
 class Scale(Transform3d):
-    def __init__(
-        self, x, y=None, z=None, dtype=torch.float32, device: str = 'cpu'
-    ):
+    def __init__(self, x, y=None, z=None, dtype=torch.float32, device='cpu'):
         """
         A Transform3d representing a scaling operation, with different scale
         factors along each coordinate axis.
@@ -504,11 +519,7 @@ class Scale(Transform3d):
 
 class Rotate(Transform3d):
     def __init__(
-        self,
-        R,
-        dtype=torch.float32,
-        device: str = 'cpu',
-        orthogonal_tol: float = 1e-5,
+        self, R, dtype=torch.float32, device='cpu', orthogonal_tol: float = 1e-5
     ):
         """
         Create a new Transform3d representing 3D rotation using a rotation
@@ -547,7 +558,7 @@ class RotateAxisAngle(Rotate):
         axis: str = 'X',
         degrees: bool = True,
         dtype=torch.float64,
-        device: str = 'cpu',
+        device='cpu',
     ):
         """
         Create a new Transform3d representing 3D rotation about an axis
@@ -656,7 +667,7 @@ def _handle_input(
     return xyz
 
 
-def _handle_angle_input(x, dtype, device: str, name: str):
+def _handle_angle_input(x, dtype, device, name: str):
     """
     Helper function for building a rotation function using angles.
     The output is always of shape (N,).

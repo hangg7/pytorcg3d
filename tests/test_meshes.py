@@ -1,10 +1,13 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
+import itertools
+import random
 import unittest
 
 import numpy as np
 import torch
 from common_testing import TestCaseMixin
+
 from pytorch3d.structures.meshes import Meshes
 
 
@@ -20,6 +23,7 @@ class TestMeshes(TestCaseMixin, unittest.TestCase):
         max_f: int = 300,
         lists_to_tensors: bool = False,
         device: str = 'cpu',
+        requires_grad: bool = False,
     ):
         """
         Function to generate a Meshes object of N meshes with
@@ -59,7 +63,12 @@ class TestMeshes(TestCaseMixin, unittest.TestCase):
 
         # Generate the actual vertices and faces.
         for i in range(num_meshes):
-            verts = torch.rand((v[i], 3), dtype=torch.float32, device=device)
+            verts = torch.rand(
+                (v[i], 3),
+                dtype=torch.float32,
+                device=device,
+                requires_grad=requires_grad,
+            )
             faces = torch.randint(
                 v[i], size=(f[i], 3), dtype=torch.int64, device=device
             )
@@ -169,6 +178,30 @@ class TestMeshes(TestCaseMixin, unittest.TestCase):
             mesh.mesh_to_edges_packed_first_idx().cpu(),
             torch.tensor([0, 3, 8], dtype=torch.int64),
         )
+
+    def test_init_error(self):
+        # Check if correct errors are raised when verts/faces are on
+        # different devices
+
+        mesh = TestMeshes.init_mesh(10, 10, 100)
+        verts_list = mesh.verts_list()  # all tensors on cpu
+        verts_list = [
+            v.to('cuda:0') if random.uniform(0, 1) > 0.5 else v
+            for v in verts_list
+        ]
+        faces_list = mesh.faces_list()
+
+        with self.assertRaises(ValueError) as cm:
+            Meshes(verts=verts_list, faces=faces_list)
+            self.assertTrue('same device' in cm.msg)
+
+        verts_padded = mesh.verts_padded()  # on cpu
+        verts_padded = verts_padded.to('cuda:0')
+        faces_padded = mesh.faces_padded()
+
+        with self.assertRaises(ValueError) as cm:
+            Meshes(verts=verts_padded, faces=faces_padded)
+            self.assertTrue('same device' in cm.msg)
 
     def test_simple_random_meshes(self):
 
@@ -391,6 +424,26 @@ class TestMeshes(TestCaseMixin, unittest.TestCase):
             self.assertSeparate(new_mesh.faces_padded(), mesh.faces_padded())
             self.assertSeparate(new_mesh.edges_packed(), mesh.edges_packed())
 
+    def test_detach(self):
+        N = 5
+        mesh = TestMeshes.init_mesh(N, 10, 100, requires_grad=True)
+        for force in [0, 1]:
+            if force:
+                # force mesh to have computed attributes
+                mesh.verts_packed()
+                mesh.edges_packed()
+                mesh.verts_padded()
+
+            new_mesh = mesh.detach()
+
+            self.assertFalse(new_mesh.verts_packed().requires_grad)
+            self.assertClose(new_mesh.verts_packed(), mesh.verts_packed())
+            self.assertFalse(new_mesh.verts_padded().requires_grad)
+            self.assertClose(new_mesh.verts_padded(), mesh.verts_padded())
+            for v, newv in zip(mesh.verts_list(), new_mesh.verts_list()):
+                self.assertFalse(newv.requires_grad)
+                self.assertClose(newv, v)
+
     def test_laplacian_packed(self):
         def naive_laplacian_packed(meshes):
             verts_packed = meshes.verts_packed()
@@ -433,7 +486,7 @@ class TestMeshes(TestCaseMixin, unittest.TestCase):
         mesh = TestMeshes.init_mesh(N, 10, 100)
         all_v = mesh.verts_packed().size(0)
         verts_per_mesh = mesh.num_verts_per_mesh()
-        for force in [0, 1]:
+        for force, deform_shape in itertools.product([0, 1], [(all_v, 3), 3]):
             if force:
                 # force mesh to have computed attributes
                 mesh._compute_packed(refresh=True)
@@ -444,7 +497,7 @@ class TestMeshes(TestCaseMixin, unittest.TestCase):
                 mesh._compute_vertex_normals(refresh=True)
 
             deform = torch.rand(
-                (all_v, 3), dtype=torch.float32, device=mesh.device
+                deform_shape, dtype=torch.float32, device=mesh.device
             )
             # new meshes class to hold the deformed mesh
             new_mesh_naive = naive_offset_verts(mesh, deform)
@@ -455,10 +508,13 @@ class TestMeshes(TestCaseMixin, unittest.TestCase):
             verts_cumsum = torch.cumsum(verts_per_mesh, 0).tolist()
             verts_cumsum.insert(0, 0)
             for i in range(N):
+                item_offset = (
+                    deform
+                    if deform.ndim == 1
+                    else deform[verts_cumsum[i] : verts_cumsum[i + 1]]
+                )
                 self.assertClose(
-                    new_mesh.verts_list()[i],
-                    mesh.verts_list()[i]
-                    + deform[verts_cumsum[i] : verts_cumsum[i + 1]],
+                    new_mesh.verts_list()[i], mesh.verts_list()[i] + item_offset
                 )
                 self.assertClose(
                     new_mesh.verts_list()[i], new_mesh_naive.verts_list()[i]
@@ -569,8 +625,8 @@ class TestMeshes(TestCaseMixin, unittest.TestCase):
 
         N = 5
         for test in ['tensor', 'scalar']:
-            mesh = TestMeshes.init_mesh(N, 10, 100)
-            for force in [0, 1]:
+            for force in (False, True):
+                mesh = TestMeshes.init_mesh(N, 10, 100)
                 if force:
                     # force mesh to have computed attributes
                     mesh.verts_packed()

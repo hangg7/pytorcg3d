@@ -4,6 +4,7 @@ from typing import Union
 
 import torch
 import torch.nn.functional as F
+
 from pytorch3d.ops.knn import knn_gather, knn_points
 from pytorch3d.structures.pointclouds import Pointclouds
 
@@ -43,7 +44,6 @@ def _handle_pointcloud_input(
         lengths = points.num_points_per_cloud()
         normals = points.normals_padded()  # either a tensor or None
     elif torch.is_tensor(points):
-        # pyre-fixme[16]: `Tensor` has no attribute `ndim`.
         if points.ndim != 3:
             raise ValueError('Expected points to be of shape (N, P, D)')
         X = points

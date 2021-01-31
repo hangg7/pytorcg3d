@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn.functional as F
+
 from pytorch3d.structures import Meshes
 
 
@@ -44,6 +45,8 @@ def ravel_index(idx, dims) -> torch.Tensor:
     return linind
 
 
+# pyre-fixme[56]: Decorator `torch.no_grad(...)` could not be called, because its
+#  type `no_grad` is not callable.
 @torch.no_grad()
 def cubify(voxels, thresh, device=None, align: str = 'topleft') -> Meshes:
     r"""

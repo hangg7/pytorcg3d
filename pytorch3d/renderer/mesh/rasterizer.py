@@ -1,11 +1,10 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-from ..cameras import get_world_to_view_transform
 from .rasterize_meshes import rasterize_meshes
 
 
@@ -26,17 +25,19 @@ class RasterizationSettings:
         'bin_size',
         'max_faces_per_bin',
         'perspective_correct',
+        'clip_barycentric_coords',
         'cull_backfaces',
     ]
 
     def __init__(
         self,
-        image_size: int = 256,
+        image_size: Union[int, Tuple[int, int]] = 256,
         blur_radius: float = 0.0,
         faces_per_pixel: int = 1,
         bin_size: Optional[int] = None,
         max_faces_per_bin: Optional[int] = None,
         perspective_correct: bool = False,
+        clip_barycentric_coords: Optional[bool] = None,
         cull_backfaces: bool = False,
     ):
         self.image_size = image_size
@@ -45,6 +46,7 @@ class RasterizationSettings:
         self.bin_size = bin_size
         self.max_faces_per_bin = max_faces_per_bin
         self.perspective_correct = perspective_correct
+        self.clip_barycentric_coords = clip_barycentric_coords
         self.cull_backfaces = cull_backfaces
 
 
@@ -74,6 +76,11 @@ class MeshRasterizer(nn.Module):
         self.cameras = cameras
         self.raster_settings = raster_settings
 
+    def to(self, device):
+        # Manually move to device cameras as it is not a subclass of nn.Module
+        self.cameras = self.cameras.to(device)
+        return self
+
     def transform(self, meshes_world, **kwargs) -> torch.Tensor:
         """
         Args:
@@ -92,17 +99,24 @@ class MeshRasterizer(nn.Module):
             msg = 'Cameras must be specified either at initialization \
                 or in the forward pass of MeshRasterizer'
             raise ValueError(msg)
+
+        n_cameras = len(cameras)
+        if n_cameras != 1 and n_cameras != len(meshes_world):
+            msg = 'Wrong number (%r) of cameras for %r meshes'
+            raise ValueError(msg % (n_cameras, len(meshes_world)))
+
         verts_world = meshes_world.verts_padded()
 
         # NOTE: Retaining view space z coordinate for now.
         # TODO: Revisit whether or not to transform z coordinate to [-1, 1] or
         # [0, 1] range.
+        eps = kwargs.get('eps', None)
         verts_view = cameras.get_world_to_view_transform(
             **kwargs
-        ).transform_points(verts_world)
+        ).transform_points(verts_world, eps=eps)
         verts_screen = cameras.get_projection_transform(
             **kwargs
-        ).transform_points(verts_view)
+        ).transform_points(verts_view, eps=eps)
         verts_screen[..., 2] = verts_view[..., 2]
         meshes_screen = meshes_world.update_padded(
             new_verts_padded=verts_screen
@@ -119,6 +133,14 @@ class MeshRasterizer(nn.Module):
         """
         meshes_screen = self.transform(meshes_world, **kwargs)
         raster_settings = kwargs.get('raster_settings', self.raster_settings)
+
+        # By default, turn on clip_barycentric_coords if blur_radius > 0.
+        # When blur_radius > 0, a face can be matched to a pixel that is outside the
+        # face, resulting in negative barycentric coordinates.
+        clip_barycentric_coords = raster_settings.clip_barycentric_coords
+        if clip_barycentric_coords is None:
+            clip_barycentric_coords = raster_settings.blur_radius > 0.0
+
         # TODO(jcjohns): Should we try to set perspective_correct automatically
         # based on the type of the camera?
         pix_to_face, zbuf, bary_coords, dists = rasterize_meshes(
@@ -129,6 +151,7 @@ class MeshRasterizer(nn.Module):
             bin_size=raster_settings.bin_size,
             max_faces_per_bin=raster_settings.max_faces_per_bin,
             perspective_correct=raster_settings.perspective_correct,
+            clip_barycentric_coords=clip_barycentric_coords,
             cull_backfaces=raster_settings.cull_backfaces,
         )
         return Fragments(

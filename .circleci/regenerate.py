@@ -13,17 +13,29 @@ import yaml
 
 # The CUDA versions which have pytorch conda packages available for linux for each
 # version of pytorch.
+# Pytorch 1.4 also supports cuda 10.0 but we no longer build for cuda 10.0 at all.
 CONDA_CUDA_VERSIONS = {
-    '1.4': ['cu92', 'cu100', 'cu101'],
-    '1.5': ['cu92', 'cu101', 'cu102'],
+    '1.4': ['cu92', 'cu101'],
+    '1.5.0': ['cu92', 'cu101', 'cu102'],
+    '1.5.1': ['cu92', 'cu101', 'cu102'],
+    '1.6.0': ['cu92', 'cu101', 'cu102'],
+    '1.7.0': ['cu101', 'cu102', 'cu110'],
+    '1.7.1': ['cu101', 'cu102', 'cu110'],
 }
+
+
+def pytorch_versions_for_python(python_version):
+    if python_version in ['3.6', '3.7', '3.8']:
+        return list(CONDA_CUDA_VERSIONS)
+    pytorch_without_py39 = ['1.4', '1.5.0', '1.5.1', '1.6.0', '1.7.0']
+    return [i for i in CONDA_CUDA_VERSIONS if i not in pytorch_without_py39]
 
 
 def workflows(prefix='', filter_branch=None, upload=False, indentation=6):
     w = []
     for btype in ['conda']:
-        for python_version in ['3.6', '3.7', '3.8']:
-            for pytorch_version in ['1.4', '1.5']:
+        for python_version in ['3.6', '3.7', '3.8', '3.9']:
+            for pytorch_version in pytorch_versions_for_python(python_version):
                 for cu_version in CONDA_CUDA_VERSIONS[pytorch_version]:
                     w += workflow_pair(
                         btype=btype,
@@ -36,11 +48,11 @@ def workflows(prefix='', filter_branch=None, upload=False, indentation=6):
                     )
     for btype in ['wheel']:
         for python_version in ['3.6', '3.7', '3.8']:
-            for cu_version in ['cpu']:
+            for cu_version in ['cu101']:
                 w += workflow_pair(
                     btype=btype,
                     python_version=python_version,
-                    pytorch_version='1.5',
+                    pytorch_version='1.6.0',
                     cu_version=cu_version,
                     prefix=prefix,
                     upload=upload,
@@ -105,6 +117,7 @@ def generate_base_workflow(
         'python_version': python_version,
         'cu_version': cu_version,
         'pytorch_version': pytorch_version,
+        'context': 'DOCKERHUB_TOKEN',
     }
 
     if filter_branch is not None:

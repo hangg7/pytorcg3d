@@ -5,6 +5,7 @@ from typing import Tuple, Union
 
 import torch
 from common_testing import TestCaseMixin
+
 from pytorch3d.ops import (
     estimate_pointcloud_local_coord_frames,
     estimate_pointcloud_normals,
@@ -150,6 +151,7 @@ class TestPCLNormals(TestCaseMixin, unittest.TestCase):
 
                     if DEBUG and run_idx == 0 and not use_pointclouds:
                         import os
+
                         from pytorch3d.io.ply_io import save_ply
 
                         # export to .ply

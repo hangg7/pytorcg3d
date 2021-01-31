@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 import torch
 from common_testing import TestCaseMixin
+
 from pytorch3d.transforms.so3 import (
     hat,
     so3_exponential_map,

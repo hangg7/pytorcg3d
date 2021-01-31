@@ -4,9 +4,11 @@ from collections import namedtuple
 from typing import Union
 
 import torch
-from pytorch3d import _C
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
+
+# pyre-fixme[21]: Could not find name `_C` in `pytorch3d`.
+from pytorch3d import _C
 
 
 _KNN = namedtuple('KNN', 'dists idx knn')
@@ -18,7 +20,11 @@ class _knn_points(Function):
     """
 
     @staticmethod
-    def forward(ctx, p1, p2, lengths1, lengths2, K, version):
+    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
+    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
+    def forward(
+        ctx, p1, p2, lengths1, lengths2, K, version, return_sorted: bool = True
+    ):
         """
         K-Nearest neighbors on point clouds.
 
@@ -36,6 +42,8 @@ class _knn_points(Function):
             K: Integer giving the number of nearest neighbors to return.
             version: Which KNN implementation to use in the backend. If version=-1,
                 the correct implementation is selected based on the shapes of the inputs.
+            return_sorted: (bool) whether to return the nearest neighbors sorted in
+                ascending order of distance.
 
         Returns:
             p1_dists: Tensor of shape (N, P1, K) giving the squared distances to
@@ -49,10 +57,11 @@ class _knn_points(Function):
                 in p2 has fewer than K points and where a cloud in p1 has fewer than P1 points.
         """
 
+        # pyre-fixme[16]: Module `pytorch3d` has no attribute `_C`.
         idx, dists = _C.knn_points_idx(p1, p2, lengths1, lengths2, K, version)
 
         # sort KNN in ascending order if K > 1
-        if K > 1:
+        if K > 1 and return_sorted:
             if lengths2.min() < K:
                 P1 = p1.shape[1]
                 mask = (
@@ -87,7 +96,7 @@ class _knn_points(Function):
         grad_p1, grad_p2 = _C.knn_points_backward(
             p1, p2, lengths1, lengths2, idx, grad_dists
         )
-        return grad_p1, grad_p2, None, None, None, None
+        return grad_p1, grad_p2, None, None, None, None, None
 
 
 def knn_points(
@@ -98,6 +107,7 @@ def knn_points(
     K: int = 1,
     version: int = -1,
     return_nn: bool = False,
+    return_sorted: bool = True,
 ):
     """
     K-Nearest neighbors on point clouds.
@@ -116,7 +126,9 @@ def knn_points(
         K: Integer giving the number of nearest neighbors to return.
         version: Which KNN implementation to use in the backend. If version=-1,
             the correct implementation is selected based on the shapes of the inputs.
-        return_nn: If set to True returns the K nearest neighors in p2 for each point in p1.
+        return_nn: If set to True returns the K nearest neighbors in p2 for each point in p1.
+        return_sorted: (bool) whether to return the nearest neighbors sorted in
+            ascending order of distance.
 
     Returns:
         dists: Tensor of shape (N, P1, K) giving the squared distances to
@@ -165,7 +177,9 @@ def knn_points(
         )
 
     # pyre-fixme[16]: `_knn_points` has no attribute `apply`.
-    p1_dists, p1_idx = _knn_points.apply(p1, p2, lengths1, lengths2, K, version)
+    p1_dists, p1_idx = _knn_points.apply(
+        p1, p2, lengths1, lengths2, K, version, return_sorted
+    )
 
     p2_nn = None
     if return_nn:

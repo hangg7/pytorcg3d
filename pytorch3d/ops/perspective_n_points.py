@@ -12,6 +12,7 @@ from typing import NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
+
 from pytorch3d.ops import points_alignment, utils as oputil
 
 
@@ -53,7 +54,7 @@ def _compute_alphas(x, c_world):
 
 
 def _build_M(y, alphas, weight):
-    """ Returns the matrix defining the reprojection equations.
+    """Returns the matrix defining the reprojection equations.
     Args:
         y: projected points in camera coordinates of size B x N x 2
         alphas: barycentric coordinates of size B x N x 4
@@ -65,6 +66,10 @@ def _build_M(y, alphas, weight):
     # prepend t with the column of v's
     def prepad(t, v):
         return F.pad(t, (1, 0), value=v)
+
+    if weight is not None:
+        # weight the alphas in order to get a correctly weighted version of M
+        alphas = alphas * weight[:, :, None]
 
     # outer left-multiply by alphas
     def lm_alphas(t):
@@ -82,14 +87,11 @@ def _build_M(y, alphas, weight):
         dim=-1,
     ).reshape(bs, -1, 12)
 
-    if weight is not None:
-        M = M * weight.repeat(1, 2)[:, :, None]
-
     return M
 
 
 def _null_space(m, kernel_dim):
-    """ Finds the null space (kernel) basis of the matrix
+    """Finds the null space (kernel) basis of the matrix
     Args:
         m: the batch of input matrices, B x N x 12
         kernel_dim: number of dimensions to approximate the kernel
@@ -105,7 +107,7 @@ def _null_space(m, kernel_dim):
 
 
 def _reproj_error(y_hat, y, weight, eps=1e-9):
-    """ Projects estimated 3D points and computes the reprojection error
+    """Projects estimated 3D points and computes the reprojection error
     Args:
         y_hat: a batch of predicted 2D points in homogeneous coordinates
         y: a batch of ground-truth 2D points
@@ -120,7 +122,7 @@ def _reproj_error(y_hat, y, weight, eps=1e-9):
 
 
 def _algebraic_error(x_w_rotated, x_cam, weight):
-    """ Computes the residual of Umeyama in 3D.
+    """Computes the residual of Umeyama in 3D.
     Args:
         x_w_rotated: The given 3D points rotated with the predicted camera.
         x_cam: the lifted 2D points y
@@ -136,7 +138,7 @@ def _algebraic_error(x_w_rotated, x_cam, weight):
 def _compute_norm_sign_scaling_factor(
     c_cam, alphas, x_world, y, weight, eps=1e-9
 ):
-    """ Given a solution, adjusts the scale and flip
+    """Given a solution, adjusts the scale and flip
     Args:
         c_cam: control points in camera coordinates
         alphas: barycentric coordinates of the points
@@ -171,8 +173,8 @@ def _compute_norm_sign_scaling_factor(
     return EpnpSolution(x_cam, R, T, err_2d, err_3d)
 
 
-def _gen_pairs(input, dim=-2, reducer=lambda l, r: ((l - r) ** 2).sum(dim=-1)):
-    """ Generates all pairs of different rows and then applies the reducer
+def _gen_pairs(input, dim=-2, reducer=lambda a, b: ((a - b) ** 2).sum(dim=-1)):
+    """Generates all pairs of different rows and then applies the reducer
     Args:
         input: a tensor
         dim: a dimension to generate pairs across
@@ -189,7 +191,7 @@ def _gen_pairs(input, dim=-2, reducer=lambda l, r: ((l - r) ** 2).sum(dim=-1)):
 
 
 def _kernel_vec_distances(v):
-    """ Computes the coefficients for linearisation of the quadratic system
+    """Computes the coefficients for linearisation of the quadratic system
         to match all pairwise distances between 4 control points (dim=1).
         The last dimension corresponds to the coefficients for quadratic terms
         Bij = Bi * Bj, where Bi and Bj correspond to kernel vectors.
@@ -199,11 +201,11 @@ def _kernel_vec_distances(v):
         a tensor of B x 6 x [(D choose 2) + D];
         for D=4, the last dim means [B11 B22 B33 B44 B12 B13 B14 B23 B24 B34].
     """
-    dv = _gen_pairs(v, dim=-3, reducer=lambda l, r: l - r)  # B x 6 x 3 x D
+    dv = _gen_pairs(v, dim=-3, reducer=lambda a, b: a - b)  # B x 6 x 3 x D
 
     # we should take dot-product of all (i,j), i < j, with coeff 2
     rows_2ij = 2.0 * _gen_pairs(
-        dv, dim=-1, reducer=lambda l, r: (l * r).sum(dim=-2)
+        dv, dim=-1, reducer=lambda a, b: (a * b).sum(dim=-2)
     )
     # this should produce B x 6 x (D choose 2) tensor
 
@@ -215,7 +217,7 @@ def _kernel_vec_distances(v):
 
 
 def _solve_lstsq_subcols(rhs, lhs, lhs_col_idx):
-    """ Solves an over-determined linear system for selected LHS columns.
+    """Solves an over-determined linear system for selected LHS columns.
         A batched version of `torch.lstsq`.
     Args:
         rhs: right-hand side vectors
@@ -235,7 +237,7 @@ def _binary_sign(t):
 
 
 def _find_null_space_coords_1(kernel_dsts, cw_dst, eps=1e-9):
-    """ Solves case 1 from the paper [1]; solve for 4 coefficients:
+    """Solves case 1 from the paper [1]; solve for 4 coefficients:
        [B11 B22 B33 B44 B12 B13 B14 B23 B24 B34]
          ^               ^   ^   ^
     Args:
@@ -255,7 +257,7 @@ def _find_null_space_coords_1(kernel_dsts, cw_dst, eps=1e-9):
 
 
 def _find_null_space_coords_2(kernel_dsts, cw_dst):
-    """ Solves case 2 from the paper; solve for 3 coefficients:
+    """Solves case 2 from the paper; solve for 3 coefficients:
         [B11 B22 B33 B44 B12 B13 B14 B23 B24 B34]
           ^   ^           ^
     Args:
@@ -281,7 +283,7 @@ def _find_null_space_coords_2(kernel_dsts, cw_dst):
 
 
 def _find_null_space_coords_3(kernel_dsts, cw_dst, eps=1e-9):
-    """ Solves case 3 from the paper; solve for 5 coefficients:
+    """Solves case 3 from the paper; solve for 5 coefficients:
         [B11 B22 B33 B44 B12 B13 B14 B23 B24 B34]
           ^   ^           ^   ^       ^
     Args:

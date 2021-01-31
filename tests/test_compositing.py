@@ -4,6 +4,7 @@ import unittest
 
 import torch
 from common_testing import TestCaseMixin, get_random_cuda_device
+
 from pytorch3d.renderer.compositing import (
     alpha_composite,
     norm_weighted_sum,

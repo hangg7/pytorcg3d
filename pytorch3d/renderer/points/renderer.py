@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
-
-
 import torch
 import torch.nn as nn
 
@@ -34,6 +32,13 @@ class PointsRenderer(nn.Module):
         self.rasterizer = rasterizer
         self.compositor = compositor
 
+    def to(self, device):
+        # Manually move to device rasterizer as the cameras
+        # within the class are not of type nn.Module
+        self.rasterizer = self.rasterizer.to(device)
+        self.compositor = self.compositor.to(device)
+        return self
+
     def forward(self, point_clouds, **kwargs) -> torch.Tensor:
         fragments = self.rasterizer(point_clouds, **kwargs)
 
@@ -48,7 +53,7 @@ class PointsRenderer(nn.Module):
             fragments.idx.long().permute(0, 3, 1, 2),
             weights,
             point_clouds.features_packed().permute(1, 0),
-            **kwargs
+            **kwargs,
         )
 
         # permute so image comes at the end

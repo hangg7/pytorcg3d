@@ -30,3 +30,7 @@ def bm_vert_align() -> None:
         kwargs_list,
         warmup_iters=1,
     )
+
+
+if __name__ == '__main__':
+    bm_vert_align()

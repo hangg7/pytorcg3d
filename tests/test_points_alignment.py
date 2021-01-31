@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from common_testing import TestCaseMixin
+
 from pytorch3d.ops import points_alignment
 from pytorch3d.structures.pointclouds import Pointclouds
 from pytorch3d.transforms import rotation_conversions
@@ -40,7 +41,9 @@ class TestICP(TestCaseMixin, unittest.TestCase):
         super().setUp()
         torch.manual_seed(42)
         np.random.seed(42)
-        trimesh_results_path = Path(__file__).resolve().parent / 'icp_data.pth'
+        trimesh_results_path = (
+            Path(__file__).resolve().parent / 'data/icp_data.pth'
+        )
         self.trimesh_results = torch.load(trimesh_results_path)
 
     @staticmethod

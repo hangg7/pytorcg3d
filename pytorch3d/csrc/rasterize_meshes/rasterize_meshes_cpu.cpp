@@ -5,14 +5,10 @@
 #include <list>
 #include <queue>
 #include <tuple>
+#include "rasterize_points/rasterization_utils.h"
 #include "utils/geometry_utils.h"
 #include "utils/vec2.h"
 #include "utils/vec3.h"
-
-float PixToNdc(int i, int S) {
-  // NDC x-offset + (i * pixel_width + half_pixel_width)
-  return -1 + (2 * i + 1.0f) / S;
-}
 
 // Get (x, y, z) values for vertex from (3, 3) tensor face.
 template <typename Face>
@@ -68,8 +64,12 @@ bool CheckPointOutsideBoundingBox(
   float x_max = face_bbox[2] + blur_radius;
   float y_max = face_bbox[3] + blur_radius;
 
+  // Faces with at least one vertex behind the camera won't render correctly
+  // and should be removed or clipped before calling the rasterizer
+  const bool z_invalid = face_bbox[4] < kEpsilon;
+
   // Check if the current point is within the triangle bounding box.
-  return (px > x_max || px < x_min || py > y_max || py < y_min);
+  return (px > x_max || px < x_min || py > y_max || py < y_min || z_invalid);
 }
 
 // Calculate areas of all faces. Returns a tensor of shape (total_faces, 1)
@@ -104,10 +104,11 @@ RasterizeMeshesNaiveCpu(
     const torch::Tensor& face_verts,
     const torch::Tensor& mesh_to_face_first_idx,
     const torch::Tensor& num_faces_per_mesh,
-    int image_size,
+    const std::tuple<int, int> image_size,
     const float blur_radius,
     const int faces_per_pixel,
     const bool perspective_correct,
+    const bool clip_barycentric_coords,
     const bool cull_backfaces) {
   if (face_verts.ndimension() != 3 || face_verts.size(1) != 3 ||
       face_verts.size(2) != 3) {
@@ -119,8 +120,8 @@ RasterizeMeshesNaiveCpu(
   }
 
   const int32_t N = mesh_to_face_first_idx.size(0); // batch_size.
-  const int H = image_size;
-  const int W = image_size;
+  const int H = std::get<0>(image_size);
+  const int W = std::get<1>(image_size);
   const int K = faces_per_pixel;
 
   auto long_opts = num_faces_per_mesh.options().dtype(torch::kInt64);
@@ -158,7 +159,7 @@ RasterizeMeshesNaiveCpu(
       const int yidx = H - 1 - yi;
 
       // Y coordinate of the top of the pixel.
-      const float yf = PixToNdc(yidx, H);
+      const float yf = PixToNonSquareNdc(yidx, H, W);
       // Iterate through pixels on this horizontal line, left to right.
       for (int xi = 0; xi < W; ++xi) {
         // Reverse the order of xi so that +X is pointing to the left in the
@@ -166,7 +167,7 @@ RasterizeMeshesNaiveCpu(
         const int xidx = W - 1 - xi;
 
         // X coordinate of the left of the pixel.
-        const float xf = PixToNdc(xidx, W);
+        const float xf = PixToNonSquareNdc(xidx, W, H);
         // Use a priority queue to hold values:
         // (z, idx, r, bary.x, bary.y. bary.z)
         std::priority_queue<std::tuple<float, int, float, float, float, float>>
@@ -213,8 +214,12 @@ RasterizeMeshesNaiveCpu(
               ? bary0
               : BarycentricPerspectiveCorrectionForward(bary0, z0, z1, z2);
 
+          const vec3<float> bary_clip =
+              !clip_barycentric_coords ? bary : BarycentricClipForward(bary);
+
           // Use barycentric coordinates to get the depth of the current pixel
-          const float pz = (bary.x * z0 + bary.y * z1 + bary.z * z2);
+          const float pz =
+              (bary_clip.x * z0 + bary_clip.y * z1 + bary_clip.z * z2);
 
           if (pz < 0) {
             continue; // Point is behind the image plane so ignore.
@@ -236,7 +241,7 @@ RasterizeMeshesNaiveCpu(
             continue;
           }
           // The current pixel lies inside the current face.
-          q.emplace(pz, f, signed_dist, bary.x, bary.y, bary.z);
+          q.emplace(pz, f, signed_dist, bary_clip.x, bary_clip.y, bary_clip.z);
           if (static_cast<int>(q.size()) > K) {
             q.pop();
           }
@@ -264,7 +269,8 @@ torch::Tensor RasterizeMeshesBackwardCpu(
     const torch::Tensor& grad_zbuf, // (N, H, W, K)
     const torch::Tensor& grad_bary, // (N, H, W, K, 3)
     const torch::Tensor& grad_dists, // (N, H, W, K)
-    const bool perspective_correct) {
+    const bool perspective_correct,
+    const bool clip_barycentric_coords) {
   const int F = face_verts.size(0);
   const int N = pix_to_face.size(0);
   const int H = pix_to_face.size(1);
@@ -285,7 +291,7 @@ torch::Tensor RasterizeMeshesBackwardCpu(
       const int yidx = H - 1 - y;
 
       // Y coordinate of the top of the pixel.
-      const float yf = PixToNdc(yidx, H);
+      const float yf = PixToNonSquareNdc(yidx, H, W);
       // Iterate through pixels on this horizontal line, left to right.
       for (int x = 0; x < W; ++x) {
         // Reverse the order of xi so that +X is pointing to the left in the
@@ -293,7 +299,7 @@ torch::Tensor RasterizeMeshesBackwardCpu(
         const int xidx = W - 1 - x;
 
         // X coordinate of the left of the pixel.
-        const float xf = PixToNdc(xidx, W);
+        const float xf = PixToNonSquareNdc(xidx, W, H);
         const vec2<float> pxy(xf, yf);
 
         // Iterate through the faces that hit this pixel.
@@ -335,13 +341,14 @@ torch::Tensor RasterizeMeshesBackwardCpu(
           const vec3<float> bary = !perspective_correct
               ? bary0
               : BarycentricPerspectiveCorrectionForward(bary0, z0, z1, z2);
+          const vec3<float> bary_clip =
+              !clip_barycentric_coords ? bary : BarycentricClipForward(bary);
 
           // Distances inside the face are negative so get the
           // correct sign to apply to the upstream gradient.
           const bool inside = bary.x > 0.0f && bary.y > 0.0f && bary.z > 0.0f;
           const float sign = inside ? -1.0f : 1.0f;
 
-          // TODO(T52813608) Add support for non-square images.
           const auto grad_dist_f = PointTriangleDistanceBackward(
               pxy, v0xy, v1xy, v2xy, sign * grad_dist_upstream);
           const auto ddist_d_v0 = std::get<1>(grad_dist_f);
@@ -354,22 +361,28 @@ torch::Tensor RasterizeMeshesBackwardCpu(
           // d_zbuf/d_bary_w0 = z0
           // d_zbuf/d_bary_w1 = z1
           // d_zbuf/d_bary_w2 = z2
-          const vec3<float> d_zbuf_d_bary(z0, z1, z2);
+          const vec3<float> d_zbuf_d_baryclip(z0, z1, z2);
 
           // Total upstream barycentric gradients are the sum of
           // external upstream gradients and contribution from zbuf.
-          vec3<float> grad_bary_f_sum =
-              (grad_bary_upstream + grad_zbuf_upstream * d_zbuf_d_bary);
+          const vec3<float> grad_bary_f_sum =
+              (grad_bary_upstream + grad_zbuf_upstream * d_zbuf_d_baryclip);
 
           vec3<float> grad_bary0 = grad_bary_f_sum;
+
+          if (clip_barycentric_coords) {
+            grad_bary0 = BarycentricClipBackward(bary, grad_bary0);
+          }
+
           if (perspective_correct) {
             auto perspective_grads = BarycentricPerspectiveCorrectionBackward(
-                bary0, z0, z1, z2, grad_bary_f_sum);
+                bary0, z0, z1, z2, grad_bary0);
             grad_bary0 = std::get<0>(perspective_grads);
             grad_face_verts[f][0][2] += std::get<1>(perspective_grads);
             grad_face_verts[f][1][2] += std::get<2>(perspective_grads);
             grad_face_verts[f][2][2] += std::get<3>(perspective_grads);
           }
+
           auto grad_bary_f =
               BarycentricCoordsBackward(pxy, v0xy, v1xy, v2xy, grad_bary0);
           const vec2<float> dbary_d_v0 = std::get<1>(grad_bary_f);
@@ -379,13 +392,13 @@ torch::Tensor RasterizeMeshesBackwardCpu(
           // Update output gradient buffer.
           grad_face_verts[f][0][0] += dbary_d_v0.x + ddist_d_v0.x;
           grad_face_verts[f][0][1] += dbary_d_v0.y + ddist_d_v0.y;
-          grad_face_verts[f][0][2] += grad_zbuf_upstream * bary.x;
+          grad_face_verts[f][0][2] += grad_zbuf_upstream * bary_clip.x;
           grad_face_verts[f][1][0] += dbary_d_v1.x + ddist_d_v1.x;
           grad_face_verts[f][1][1] += dbary_d_v1.y + ddist_d_v1.y;
-          grad_face_verts[f][1][2] += grad_zbuf_upstream * bary.y;
+          grad_face_verts[f][1][2] += grad_zbuf_upstream * bary_clip.y;
           grad_face_verts[f][2][0] += dbary_d_v2.x + ddist_d_v2.x;
           grad_face_verts[f][2][1] += dbary_d_v2.y + ddist_d_v2.y;
-          grad_face_verts[f][2][2] += grad_zbuf_upstream * bary.z;
+          grad_face_verts[f][2][2] += grad_zbuf_upstream * bary_clip.z;
         }
       }
     }
@@ -397,7 +410,7 @@ torch::Tensor RasterizeMeshesCoarseCpu(
     const torch::Tensor& face_verts,
     const torch::Tensor& mesh_to_face_first_idx,
     const torch::Tensor& num_faces_per_mesh,
-    const int image_size,
+    const std::tuple<int, int> image_size,
     const float blur_radius,
     const int bin_size,
     const int max_faces_per_bin) {
@@ -412,11 +425,12 @@ torch::Tensor RasterizeMeshesCoarseCpu(
   const int N = num_faces_per_mesh.size(0); // batch size.
   const int M = max_faces_per_bin;
 
-  // Assume square images. TODO(T52813608) Support non square images.
-  const float height = image_size;
-  const float width = image_size;
-  const int BH = 1 + (height - 1) / bin_size; // Integer division round up.
-  const int BW = 1 + (width - 1) / bin_size; // Integer division round up.
+  const float H = std::get<0>(image_size);
+  const float W = std::get<1>(image_size);
+
+  // Integer division round up.
+  const int BH = 1 + (H - 1) / bin_size;
+  const int BW = 1 + (W - 1) / bin_size;
 
   auto opts = num_faces_per_mesh.options().dtype(torch::kInt32);
   torch::Tensor faces_per_bin = torch::zeros({N, BH, BW}, opts);
@@ -427,8 +441,13 @@ torch::Tensor RasterizeMeshesCoarseCpu(
   auto face_bboxes = ComputeFaceBoundingBoxes(face_verts);
   auto face_bboxes_a = face_bboxes.accessor<float, 2>();
 
-  const float pixel_width = 2.0f / image_size;
-  const float bin_width = pixel_width * bin_size;
+  const float ndc_x_range = NonSquareNdcRange(W, H);
+  const float pixel_width_x = ndc_x_range / W;
+  const float bin_width_x = pixel_width_x * bin_size;
+
+  const float ndc_y_range = NonSquareNdcRange(H, W);
+  const float pixel_width_y = ndc_y_range / H;
+  const float bin_width_y = pixel_width_y * bin_size;
 
   // Iterate through the meshes in the batch.
   for (int n = 0; n < N; ++n) {
@@ -437,12 +456,12 @@ torch::Tensor RasterizeMeshesCoarseCpu(
         (face_start_idx + num_faces_per_mesh[n].item().to<int32_t>());
 
     float bin_y_min = -1.0f;
-    float bin_y_max = bin_y_min + bin_width;
+    float bin_y_max = bin_y_min + bin_width_y;
 
     // Iterate through the horizontal bins from top to bottom.
     for (int by = 0; by < BH; ++by) {
       float bin_x_min = -1.0f;
-      float bin_x_max = bin_x_min + bin_width;
+      float bin_x_max = bin_x_min + bin_width_x;
 
       // Iterate through bins on this horizontal line, left to right.
       for (int bx = 0; bx < BW; ++bx) {
@@ -454,10 +473,13 @@ torch::Tensor RasterizeMeshesCoarseCpu(
           float face_y_min = face_bboxes_a[f][1] - std::sqrt(blur_radius);
           float face_x_max = face_bboxes_a[f][2] + std::sqrt(blur_radius);
           float face_y_max = face_bboxes_a[f][3] + std::sqrt(blur_radius);
-          float face_z_max = face_bboxes_a[f][5];
+          float face_z_min = face_bboxes_a[f][4];
 
-          if (face_z_max < 0) {
-            continue; // Face is behind the camera.
+          // Faces with at least one vertex behind the camera won't render
+          // correctly and should be removed or clipped before calling the
+          // rasterizer
+          if (face_z_min < kEpsilon) {
+            continue;
           }
 
           // Use a half-open interval so that faces exactly on the
@@ -481,11 +503,11 @@ torch::Tensor RasterizeMeshesCoarseCpu(
 
         // Shift the bin to the right for the next loop iteration
         bin_x_min = bin_x_max;
-        bin_x_max = bin_x_min + bin_width;
+        bin_x_max = bin_x_min + bin_width_x;
       }
       // Shift the bin down for the next loop iteration
       bin_y_min = bin_y_max;
-      bin_y_max = bin_y_min + bin_width;
+      bin_y_max = bin_y_min + bin_width_y;
     }
   }
   return bin_faces;

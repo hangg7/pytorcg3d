@@ -5,16 +5,20 @@ import unittest
 import warnings
 from io import StringIO
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import torch
 from common_testing import TestCaseMixin
-from pytorch3d.io import load_obj, load_objs_as_meshes, save_obj
+from iopath.common.file_io import PathManager
+
+from pytorch3d.io import IO, load_obj, load_objs_as_meshes, save_obj
 from pytorch3d.io.mtl_io import (
     _bilinear_interpolation_grid_sample,
     _bilinear_interpolation_vectorized,
+    _parse_mtl,
 )
-from pytorch3d.structures import Meshes, Textures, join_meshes_as_batch
-from pytorch3d.structures.meshes import join_mesh
+from pytorch3d.renderer import TexturesAtlas, TexturesUV, TexturesVertex
+from pytorch3d.structures import Meshes, join_meshes_as_batch
 from pytorch3d.utils import torus
 
 
@@ -151,6 +155,70 @@ class TestMeshObjIO(TestCaseMixin, unittest.TestCase):
         self.assertClose(faces.textures_idx, expected_faces_textures_idx)
         self.assertTrue(materials is None)
         self.assertTrue(tex_maps is None)
+
+    def test_load_obj_complex_pluggable(self):
+        """
+        This won't work on Windows due to the behavior of NamedTemporaryFile
+        """
+        obj_file = '\n'.join(
+            [
+                '# this is a comment',  # Comments should be ignored.
+                'v 0.1 0.2 0.3',
+                'v 0.2 0.3 0.4',
+                'v 0.3 0.4 0.5',
+                'v 0.4 0.5 0.6',
+                'vn 0.000000 0.000000 -1.000000',
+                'vn -1.000000 -0.000000 -0.000000',
+                'vn -0.000000 -0.000000 1.000000',  # Normals should not be ignored.
+                'v 0.5 0.6 0.7',
+                'vt 0.749279 0.501284 0.0',  # Some files add 0.0 - ignore this.
+                'vt 0.999110 0.501077',
+                'vt 0.999455 0.750380',
+                'f 1 2 3',
+                'f 1 2 4 3 5',  # Polygons should be split into triangles
+                'f 2/1/2 3/1/2 4/2/2',  # Texture/normals are loaded correctly.
+                'f -1 -2 1',  # Negative indexing counts from the end.
+            ]
+        )
+        io = IO()
+        with NamedTemporaryFile(mode='w', suffix='.obj') as f:
+            f.write(obj_file)
+            f.flush()
+            mesh = io.load_mesh(f.name)
+            mesh_from_path = io.load_mesh(Path(f.name))
+
+        with NamedTemporaryFile(mode='w', suffix='.ply') as f:
+            f.write(obj_file)
+            f.flush()
+            with self.assertRaisesRegex(ValueError, 'Invalid file header.'):
+                io.load_mesh(f.name)
+
+        expected_verts = torch.tensor(
+            [
+                [0.1, 0.2, 0.3],
+                [0.2, 0.3, 0.4],
+                [0.3, 0.4, 0.5],
+                [0.4, 0.5, 0.6],
+                [0.5, 0.6, 0.7],
+            ],
+            dtype=torch.float32,
+        )
+        expected_faces = torch.tensor(
+            [
+                [0, 1, 2],  # First face
+                [0, 1, 3],  # Second face (polygon)
+                [0, 3, 2],  # Second face (polygon)
+                [0, 2, 4],  # Second face (polygon)
+                [1, 2, 3],  # Third face (normals / texture)
+                [4, 3, 0],  # Fourth face (negative indices)
+            ],
+            dtype=torch.int64,
+        )
+        self.assertClose(mesh.verts_padded(), expected_verts[None])
+        self.assertClose(mesh.faces_padded(), expected_faces[None])
+        self.assertClose(mesh_from_path.verts_padded(), expected_verts[None])
+        self.assertClose(mesh_from_path.faces_padded(), expected_faces[None])
+        self.assertIsNone(mesh.textures)
 
     def test_load_obj_normals_only(self):
         obj_file = '\n'.join(
@@ -483,6 +551,55 @@ class TestMeshObjIO(TestCaseMixin, unittest.TestCase):
                     )
                 )
 
+    def test_load_mtl_with_spaces_in_resource_filename(self):
+        """
+        Check that the texture image for materials in mtl files
+        is loaded correctly even if there is a space in the file name
+        e.g. material 1.png
+        """
+        mtl_file = '\n'.join(
+            [
+                'newmtl material_1',
+                'map_Kd material 1.png',
+                'Ka 1.000 1.000 1.000',  # white
+                'Kd 1.000 1.000 1.000',  # white
+                'Ks 0.000 0.000 0.000',  # black
+                'Ns 10.0',
+            ]
+        )
+        mtl_file = StringIO(mtl_file)
+        material_properties, texture_files = _parse_mtl(
+            mtl_file, path_manager=PathManager(), device='cpu'
+        )
+
+        dtype = torch.float32
+        expected_materials = {
+            'material_1': {
+                'ambient_color': torch.tensor([1.0, 1.0, 1.0], dtype=dtype),
+                'diffuse_color': torch.tensor([1.0, 1.0, 1.0], dtype=dtype),
+                'specular_color': torch.tensor([0.0, 0.0, 0.0], dtype=dtype),
+                'shininess': torch.tensor([10.0], dtype=dtype),
+            }
+        }
+        # Check that there is a material with name material_1
+        self.assertTrue(tuple(texture_files.keys()) == ('material_1',))
+        # Check that there is an image with name material 1.png
+        self.assertTrue(texture_files['material_1'] == 'material 1.png')
+
+        # Check all keys and values in dictionary are the same.
+        for n1, n2 in zip(
+            material_properties.keys(), expected_materials.keys()
+        ):
+            self.assertTrue(n1 == n2)
+            for k1, k2 in zip(
+                material_properties[n1].keys(), expected_materials[n2].keys()
+            ):
+                self.assertTrue(
+                    torch.allclose(
+                        material_properties[n1][k1], expected_materials[n2][k2]
+                    )
+                )
+
     def test_load_mtl_texture_atlas_compare_softras(self):
         # Load saved texture atlas created with SoftRas.
         device = torch.device('cuda:0')
@@ -495,9 +612,13 @@ class TestMeshObjIO(TestCaseMixin, unittest.TestCase):
         # Note, the reference texture atlas generated using SoftRas load_obj function
         # is too large to check in to the repo. Download the file to run the test locally.
         if not os.path.exists(expected_atlas_fname):
-            url = 'https://dl.fbaipublicfiles.com/pytorch3d/data/tests/cow_texture_atlas_softras.pt'
+            url = (
+                'https://dl.fbaipublicfiles.com/pytorch3d/data/'
+                'tests/cow_texture_atlas_softras.pt'
+            )
             msg = (
-                'cow_texture_atlas_softras.pt not found, download from %s, save it at the path %s, and rerun'
+                'cow_texture_atlas_softras.pt not found, download from %s, '
+                'save it at the path %s, and rerun'
                 % (url, expected_atlas_fname)
             )
             warnings.warn(msg)
@@ -559,6 +680,40 @@ class TestMeshObjIO(TestCaseMixin, unittest.TestCase):
         self.assertTrue(aux.texture_images is None)
         self.assertTrue(aux.normals is None)
         self.assertTrue(aux.verts_uvs is None)
+
+    def test_load_obj_mlt_no_image(self):
+        DATA_DIR = Path(__file__).resolve().parent / 'data'
+        obj_filename = 'obj_mtl_no_image/model.obj'
+        filename = os.path.join(DATA_DIR, obj_filename)
+        R = 8
+        verts, faces, aux = load_obj(
+            filename,
+            load_textures=True,
+            create_texture_atlas=True,
+            texture_atlas_size=R,
+            texture_wrap=None,
+        )
+
+        expected_verts = torch.tensor(
+            [
+                [0.1, 0.2, 0.3],
+                [0.2, 0.3, 0.4],
+                [0.3, 0.4, 0.5],
+                [0.4, 0.5, 0.6],
+            ],
+            dtype=torch.float32,
+        )
+        expected_faces = torch.tensor([[0, 1, 2], [0, 1, 3]], dtype=torch.int64)
+        self.assertTrue(torch.allclose(verts, expected_verts))
+        self.assertTrue(torch.allclose(faces.verts_idx, expected_faces))
+
+        # Check that the material diffuse color has been assigned to all the
+        # values in the texture atlas.
+        expected_atlas = torch.tensor([0.5, 0.0, 0.0], dtype=torch.float32)
+        expected_atlas = expected_atlas[None, None, None, :].expand(2, R, R, -1)
+        self.assertTrue(torch.allclose(aux.texture_atlas, expected_atlas))
+        self.assertEqual(len(aux.material_colors.keys()), 1)
+        self.assertEqual(list(aux.material_colors.keys()), ['material_1'])
 
     def test_load_obj_missing_texture(self):
         DATA_DIR = Path(__file__).resolve().parent / 'data'
@@ -660,22 +815,31 @@ class TestMeshObjIO(TestCaseMixin, unittest.TestCase):
 
             check_item(mesh.verts_padded(), mesh3.verts_padded())
             check_item(mesh.faces_padded(), mesh3.faces_padded())
+
             if mesh.textures is not None:
-                check_item(
-                    mesh.textures.maps_padded(), mesh3.textures.maps_padded()
-                )
-                check_item(
-                    mesh.textures.faces_uvs_padded(),
-                    mesh3.textures.faces_uvs_padded(),
-                )
-                check_item(
-                    mesh.textures.verts_uvs_padded(),
-                    mesh3.textures.verts_uvs_padded(),
-                )
-                check_item(
-                    mesh.textures.verts_rgb_padded(),
-                    mesh3.textures.verts_rgb_padded(),
-                )
+                if isinstance(mesh.textures, TexturesUV):
+                    check_item(
+                        mesh.textures.faces_uvs_padded(),
+                        mesh3.textures.faces_uvs_padded(),
+                    )
+                    check_item(
+                        mesh.textures.verts_uvs_padded(),
+                        mesh3.textures.verts_uvs_padded(),
+                    )
+                    check_item(
+                        mesh.textures.maps_padded(),
+                        mesh3.textures.maps_padded(),
+                    )
+                elif isinstance(mesh.textures, TexturesVertex):
+                    check_item(
+                        mesh.textures.verts_features_padded(),
+                        mesh3.textures.verts_features_padded(),
+                    )
+                elif isinstance(mesh.textures, TexturesAtlas):
+                    check_item(
+                        mesh.textures.atlas_padded(),
+                        mesh3.textures.atlas_padded(),
+                    )
 
         DATA_DIR = (
             Path(__file__).resolve().parent.parent / 'docs/tutorials/data'
@@ -702,16 +866,24 @@ class TestMeshObjIO(TestCaseMixin, unittest.TestCase):
         check_triple(mesh_notex, mesh3_notex)
         self.assertIsNone(mesh_notex.textures)
 
+        # meshes with vertex texture, join into a batch.
         verts = torch.randn((4, 3), dtype=torch.float32)
         faces = torch.tensor([[2, 1, 0], [3, 1, 0]], dtype=torch.int64)
-        vert_tex = torch.tensor(
-            [[0, 1, 0], [0, 1, 1], [1, 1, 0], [1, 1, 1]], dtype=torch.float32
-        )
-        tex = Textures(verts_rgb=vert_tex[None, :])
-        mesh_rgb = Meshes(verts=[verts], faces=[faces], textures=tex)
+        vert_tex = torch.ones_like(verts)
+        rgb_tex = TexturesVertex(verts_features=[vert_tex])
+        mesh_rgb = Meshes(verts=[verts], faces=[faces], textures=rgb_tex)
         mesh_rgb3 = join_meshes_as_batch([mesh_rgb, mesh_rgb, mesh_rgb])
         check_triple(mesh_rgb, mesh_rgb3)
 
+        # meshes with texture atlas, join into a batch.
+        device = 'cuda:0'
+        atlas = torch.rand((2, 4, 4, 3), dtype=torch.float32, device=device)
+        atlas_tex = TexturesAtlas(atlas=[atlas])
+        mesh_atlas = Meshes(verts=[verts], faces=[faces], textures=atlas_tex)
+        mesh_atlas3 = join_meshes_as_batch([mesh_atlas, mesh_atlas, mesh_atlas])
+        check_triple(mesh_atlas, mesh_atlas3)
+
+        # Test load multiple meshes with textures into a batch.
         teapot_obj = DATA_DIR / 'teapot.obj'
         mesh_teapot = load_objs_as_meshes([teapot_obj])
         teapot_verts, teapot_faces = mesh_teapot.get_mesh_verts_faces(0)
@@ -732,47 +904,9 @@ class TestMeshObjIO(TestCaseMixin, unittest.TestCase):
         self.assertClose(cow3_tea.verts_list()[3], mesh_teapot.verts_list()[0])
         self.assertClose(cow3_tea.faces_list()[3], mesh_teapot.faces_list()[0])
 
-    def test_join_meshes(self):
-        """
-        Test that join_mesh joins single meshes and the corresponding values are
-        consistent with the single meshes.
-        """
-
-        # Load cow mesh.
-        DATA_DIR = (
-            Path(__file__).resolve().parent.parent / 'docs/tutorials/data'
-        )
-        cow_obj = DATA_DIR / 'cow_mesh/cow.obj'
-
-        cow_mesh = load_objs_as_meshes([cow_obj])
-        cow_verts, cow_faces = cow_mesh.get_mesh_verts_faces(0)
-        # Join a batch of three single meshes and check that the values are consistent
-        # with the individual meshes.
-        cow_mesh3 = join_mesh([cow_mesh, cow_mesh, cow_mesh])
-
-        def check_item(x, y, offset):
-            self.assertClose(
-                torch.cat([x, x + offset, x + 2 * offset], dim=1), y
-            )
-
-        check_item(cow_mesh.verts_padded(), cow_mesh3.verts_padded(), 0)
-        check_item(
-            cow_mesh.faces_padded(), cow_mesh3.faces_padded(), cow_mesh._V
-        )
-
-        # Test the joining of meshes of different sizes.
-        teapot_obj = DATA_DIR / 'teapot.obj'
-        teapot_mesh = load_objs_as_meshes([teapot_obj])
-        teapot_verts, teapot_faces = teapot_mesh.get_mesh_verts_faces(0)
-
-        mix_mesh = join_mesh([cow_mesh, teapot_mesh])
-        mix_verts, mix_faces = mix_mesh.get_mesh_verts_faces(0)
-        self.assertEqual(len(mix_mesh), 1)
-
-        self.assertClose(mix_verts[: cow_mesh._V], cow_verts)
-        self.assertClose(mix_faces[: cow_mesh._F], cow_faces)
-        self.assertClose(mix_verts[cow_mesh._V :], teapot_verts)
-        self.assertClose(mix_faces[cow_mesh._F :], teapot_faces + cow_mesh._V)
+        # Check error raised if all meshes in the batch don't have the same texture type
+        with self.assertRaisesRegex(ValueError, 'same type of texture'):
+            join_meshes_as_batch([mesh_atlas, mesh_rgb, mesh_atlas])
 
     @staticmethod
     def _bm_save_obj(

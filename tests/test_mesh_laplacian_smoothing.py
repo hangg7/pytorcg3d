@@ -4,6 +4,7 @@
 import unittest
 
 import torch
+
 from pytorch3d.loss.mesh_laplacian_smoothing import mesh_laplacian_smoothing
 from pytorch3d.structures.meshes import Meshes
 

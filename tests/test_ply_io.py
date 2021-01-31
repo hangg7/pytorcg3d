@@ -3,11 +3,79 @@
 import struct
 import unittest
 from io import BytesIO, StringIO
+from tempfile import NamedTemporaryFile, TemporaryFile
 
+import numpy as np
 import torch
 from common_testing import TestCaseMixin
-from pytorch3d.io.ply_io import _load_ply_raw, load_ply, save_ply
+from iopath.common.file_io import PathManager
+
+import pytorch3d.io.ply_io
+from pytorch3d.io import IO
+from pytorch3d.io.ply_io import load_ply, save_ply
+from pytorch3d.structures import Pointclouds
 from pytorch3d.utils import torus
+
+
+global_path_manager = PathManager()
+
+
+def _load_ply_raw(stream):
+    return pytorch3d.io.ply_io._load_ply_raw(stream, global_path_manager)
+
+
+CUBE_PLY_LINES = [
+    'ply',
+    'format ascii 1.0',
+    'comment made by Greg Turk',
+    'comment this file is a cube',
+    'element vertex 8',
+    'property float x',
+    'property float y',
+    'property float z',
+    'element face 6',
+    'property list uchar int vertex_index',
+    'end_header',
+    '0 0 0',
+    '0 0 1',
+    '0 1 1',
+    '0 1 0',
+    '1 0 0',
+    '1 0 1',
+    '1 1 1',
+    '1 1 0',
+    '4 0 1 2 3',
+    '4 7 6 5 4',
+    '4 0 4 5 1',
+    '4 1 5 6 2',
+    '4 2 6 7 3',
+    '4 3 7 4 0',
+]
+
+CUBE_VERTS = [
+    [0, 0, 0],
+    [0, 0, 1],
+    [0, 1, 1],
+    [0, 1, 0],
+    [1, 0, 0],
+    [1, 0, 1],
+    [1, 1, 1],
+    [1, 1, 0],
+]
+CUBE_FACES = [
+    [0, 1, 2],
+    [7, 6, 5],
+    [0, 4, 5],
+    [1, 5, 6],
+    [2, 6, 7],
+    [3, 7, 4],
+    [0, 2, 3],
+    [7, 5, 4],
+    [0, 5, 1],
+    [1, 6, 2],
+    [2, 7, 3],
+    [3, 4, 0],
+]
 
 
 class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
@@ -60,7 +128,8 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
             self.assertTupleEqual(data['face'].shape, (6, 4))
             self.assertClose([0, 1, 2, 3], data['face'][0])
             self.assertClose([3, 7, 4, 0], data['face'][5])
-            self.assertTupleEqual(data['vertex'].shape, (8, 3))
+            [vertex0] = data['vertex']
+            self.assertTupleEqual(vertex0.shape, (8, 3))
             irregular = data['irregular_list']
             self.assertEqual(len(irregular), 3)
             self.assertEqual(type(irregular), list)
@@ -72,35 +141,7 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
             self.assertClose(x, [4, 5, 1])
 
     def test_load_simple_ascii(self):
-        ply_file = '\n'.join(
-            [
-                'ply',
-                'format ascii 1.0',
-                'comment made by Greg Turk',
-                'comment this file is a cube',
-                'element vertex 8',
-                'property float x',
-                'property float y',
-                'property float z',
-                'element face 6',
-                'property list uchar int vertex_index',
-                'end_header',
-                '0 0 0',
-                '0 0 1',
-                '0 1 1',
-                '0 1 0',
-                '1 0 0',
-                '1 0 1',
-                '1 1 1',
-                '1 1 0',
-                '4 0 1 2 3',
-                '4 7 6 5 4',
-                '4 0 4 5 1',
-                '4 1 5 6 2',
-                '4 2 6 7 3',
-                '4 3 7 4 0',
-            ]
-        )
+        ply_file = '\n'.join(CUBE_PLY_LINES)
         for line_ending in [None, '\n', '\r\n']:
             if line_ending is None:
                 stream = StringIO(ply_file)
@@ -112,39 +153,52 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
             verts, faces = load_ply(stream)
             self.assertEqual(verts.shape, (8, 3))
             self.assertEqual(faces.shape, (12, 3))
-            verts_expected = [
-                [0, 0, 0],
-                [0, 0, 1],
-                [0, 1, 1],
-                [0, 1, 0],
-                [1, 0, 0],
-                [1, 0, 1],
-                [1, 1, 1],
-                [1, 1, 0],
-            ]
-            self.assertClose(verts, torch.FloatTensor(verts_expected))
-            faces_expected = [
-                [0, 1, 2],
-                [7, 6, 5],
-                [0, 4, 5],
-                [1, 5, 6],
-                [2, 6, 7],
-                [3, 7, 4],
-                [0, 2, 3],
-                [7, 5, 4],
-                [0, 5, 1],
-                [1, 6, 2],
-                [2, 7, 3],
-                [3, 4, 0],
-            ]
-            self.assertClose(faces, torch.LongTensor(faces_expected))
+            self.assertClose(verts, torch.FloatTensor(CUBE_VERTS))
+            self.assertClose(faces, torch.LongTensor(CUBE_FACES))
+
+    def test_pluggable_load_cube(self):
+        """
+        This won't work on Windows due to NamedTemporaryFile being reopened.
+        """
+        ply_file = '\n'.join(CUBE_PLY_LINES)
+        io = IO()
+        with NamedTemporaryFile(mode='w', suffix='.ply') as f:
+            f.write(ply_file)
+            f.flush()
+            mesh = io.load_mesh(f.name)
+        self.assertClose(
+            mesh.verts_padded(), torch.FloatTensor(CUBE_VERTS)[None]
+        )
+        self.assertClose(
+            mesh.faces_padded(), torch.LongTensor(CUBE_FACES)[None]
+        )
+
+        device = torch.device('cuda:0')
+
+        with NamedTemporaryFile(mode='w', suffix='.ply') as f2:
+            io.save_mesh(mesh, f2.name)
+            f2.flush()
+            mesh2 = io.load_mesh(f2.name, device=device)
+        self.assertEqual(mesh2.verts_padded().device, device)
+        self.assertClose(mesh2.verts_padded().cpu(), mesh.verts_padded())
+        self.assertClose(mesh2.faces_padded().cpu(), mesh.faces_padded())
+
+        with NamedTemporaryFile(mode='w') as f3:
+            with self.assertRaisesRegex(
+                ValueError, 'No mesh interpreter found to write to'
+            ):
+                io.save_mesh(mesh, f3.name)
+            with self.assertRaisesRegex(
+                ValueError, 'No mesh interpreter found to read '
+            ):
+                io.load_mesh(f3.name)
 
     def test_save_ply_invalid_shapes(self):
         # Invalid vertices shape
         with self.assertRaises(ValueError) as error:
             verts = torch.FloatTensor([[0.1, 0.2, 0.3, 0.4]])  # (V, 4)
             faces = torch.LongTensor([[0, 1, 2]])
-            save_ply(StringIO(), verts, faces)
+            save_ply(BytesIO(), verts, faces)
         expected_message = "Argument 'verts' should either be empty or of shape (num_verts, 3)."
         self.assertTrue(expected_message, error.exception)
 
@@ -152,7 +206,7 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
         with self.assertRaises(ValueError) as error:
             verts = torch.FloatTensor([[0.1, 0.2, 0.3]])
             faces = torch.LongTensor([[0, 1, 2, 3]])  # (F, 4)
-            save_ply(StringIO(), verts, faces)
+            save_ply(BytesIO(), verts, faces)
         expected_message = "Argument 'faces' should either be empty or of shape (num_faces, 3)."
         self.assertTrue(expected_message, error.exception)
 
@@ -161,14 +215,14 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
         verts = torch.FloatTensor([[0.1, 0.2, 0.3]])
         faces = torch.LongTensor([[0, 1, 2]])
         with self.assertWarnsRegex(UserWarning, message_regex):
-            save_ply(StringIO(), verts, faces)
+            save_ply(BytesIO(), verts, faces)
 
         faces = torch.LongTensor([[-1, 0, 1]])
         with self.assertWarnsRegex(UserWarning, message_regex):
-            save_ply(StringIO(), verts, faces)
+            save_ply(BytesIO(), verts, faces)
 
     def _test_save_load(self, verts, faces):
-        f = StringIO()
+        f = BytesIO()
         save_ply(f, verts, faces)
         f.seek(0)
         # raise Exception(f.getvalue())
@@ -177,9 +231,13 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
             expected_verts = torch.zeros(size=(0, 3), dtype=torch.float32)
         if not len(expected_faces):  # Always compare with an (F, 3) tensor
             expected_faces = torch.zeros(size=(0, 3), dtype=torch.int64)
+
         actual_verts, actual_faces = load_ply(f)
         self.assertClose(expected_verts, actual_verts)
-        self.assertClose(expected_faces, actual_faces)
+        if len(actual_verts):
+            self.assertClose(expected_faces, actual_faces)
+        else:
+            self.assertEqual(actual_faces.numel(), 0)
 
     def test_normals_save(self):
         verts = torch.tensor(
@@ -189,7 +247,7 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
         normals = torch.tensor(
             [[0, 1, 0], [1, 0, 0], [0, 0, 1], [1, 0, 0]], dtype=torch.float32
         )
-        file = StringIO()
+        file = BytesIO()
         save_ply(file, verts=verts, faces=faces, verts_normals=normals)
         file.close()
 
@@ -203,9 +261,10 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
         self._test_save_load(verts, faces)
 
         # Faces + empty vertices
-        message_regex = 'Faces have invalid indices'
+        # => We don't save the faces
         verts = torch.FloatTensor([])
         faces = torch.LongTensor([[0, 1, 2]])
+        message_regex = "Empty 'verts' provided"
         with self.assertWarnsRegex(UserWarning, message_regex):
             self._test_save_load(verts, faces)
 
@@ -214,7 +273,6 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
             self._test_save_load(verts, faces)
 
         # Empty vertices + empty faces
-        message_regex = "Empty 'verts' and 'faces' arguments provided"
         verts0 = torch.FloatTensor([])
         faces0 = torch.LongTensor([])
         with self.assertWarnsRegex(UserWarning, message_regex):
@@ -233,15 +291,211 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
 
     def test_simple_save(self):
         verts = torch.tensor(
-            [[0, 0, 0], [0, 0, 1], [0, 1, 0], [1, 0, 0]], dtype=torch.float32
+            [[0, 0, 0], [0, 0, 1], [0, 1, 0], [1, 0, 0], [1, 2, 0]],
+            dtype=torch.float32,
         )
         faces = torch.tensor([[0, 1, 2], [0, 3, 4]])
-        file = StringIO()
-        save_ply(file, verts=verts, faces=faces)
-        file.seek(0)
-        verts2, faces2 = load_ply(file)
-        self.assertClose(verts, verts2)
-        self.assertClose(faces, faces2)
+        for filetype in BytesIO, TemporaryFile:
+            lengths = {}
+            for ascii in [True, False]:
+                file = filetype()
+                save_ply(file, verts=verts, faces=faces, ascii=ascii)
+                lengths[ascii] = file.tell()
+
+                file.seek(0)
+                verts2, faces2 = load_ply(file)
+                self.assertClose(verts, verts2)
+                self.assertClose(faces, faces2)
+
+                file.seek(0)
+                if ascii:
+                    file.read().decode('ascii')
+                else:
+                    with self.assertRaises(UnicodeDecodeError):
+                        file.read().decode('ascii')
+
+                if filetype is TemporaryFile:
+                    file.close()
+            self.assertLess(
+                lengths[False], lengths[True], 'ascii should be longer'
+            )
+
+    def test_heterogenous_property(self):
+        ply_file_ascii = '\n'.join(
+            [
+                'ply',
+                'format ascii 1.0',
+                'element vertex 8',
+                'property float x',
+                'property int y',
+                'property int z',
+                'end_header',
+                '0 0 0',
+                '0 0 1',
+                '0 1 1',
+                '0 1 0',
+                '1 0 0',
+                '1 0 1',
+                '1 1 1',
+                '1 1 0',
+            ]
+        )
+        ply_file_binary = '\n'.join(
+            [
+                'ply',
+                'format binary_little_endian 1.0',
+                'element vertex 8',
+                'property uchar x',
+                'property char y',
+                'property char z',
+                'end_header',
+                '',
+            ]
+        )
+        data = [
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            1,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+        ]
+        stream_ascii = StringIO(ply_file_ascii)
+        stream_binary = BytesIO(ply_file_binary.encode('ascii') + bytes(data))
+        X = np.array([[0, 0, 0, 0, 1, 1, 1, 1]]).T
+        YZ = np.array([0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0])
+        for stream in (stream_ascii, stream_binary):
+            header, elements = _load_ply_raw(stream)
+            [x, yz] = elements['vertex']
+            self.assertClose(x, X)
+            self.assertClose(yz, YZ.reshape(8, 2))
+
+    def test_load_cloudcompare_pointcloud(self):
+        """
+        Test loading a pointcloud styled like some cloudcompare output.
+        cloudcompare is an open source 3D point cloud processing software.
+        """
+        header = '\n'.join(
+            [
+                'ply',
+                'format binary_little_endian 1.0',
+                'obj_info Not a key-value pair!',
+                'element vertex 8',
+                'property double x',
+                'property double y',
+                'property double z',
+                'property uchar red',
+                'property uchar green',
+                'property uchar blue',
+                'property float my_Favorite',
+                'end_header',
+                '',
+            ]
+        ).encode('ascii')
+        data = struct.pack('<' + 'dddBBBf' * 8, *range(56))
+        io = IO()
+        with NamedTemporaryFile(mode='wb', suffix='.ply') as f:
+            f.write(header)
+            f.write(data)
+            f.flush()
+            pointcloud = io.load_pointcloud(f.name)
+
+        self.assertClose(
+            pointcloud.points_padded()[0],
+            torch.FloatTensor([0, 1, 2]) + 7 * torch.arange(8)[:, None],
+        )
+        self.assertClose(
+            pointcloud.features_padded()[0],
+            torch.FloatTensor([3, 4, 5]) + 7 * torch.arange(8)[:, None],
+        )
+
+    def test_save_pointcloud(self):
+        header = '\n'.join(
+            [
+                'ply',
+                'format binary_little_endian 1.0',
+                'element vertex 8',
+                'property float x',
+                'property float y',
+                'property float z',
+                'property float red',
+                'property float green',
+                'property float blue',
+                'end_header',
+                '',
+            ]
+        ).encode('ascii')
+        data = struct.pack('<' + 'f' * 48, *range(48))
+        points = torch.FloatTensor([0, 1, 2]) + 6 * torch.arange(8)[:, None]
+        features = torch.FloatTensor([3, 4, 5]) + 6 * torch.arange(8)[:, None]
+        pointcloud = Pointclouds(points=[points], features=[features])
+
+        io = IO()
+        with NamedTemporaryFile(mode='rb', suffix='.ply') as f:
+            io.save_pointcloud(data=pointcloud, path=f.name)
+            f.flush()
+            f.seek(0)
+            actual_data = f.read()
+            reloaded_pointcloud = io.load_pointcloud(f.name)
+
+        self.assertEqual(header + data, actual_data)
+        self.assertClose(reloaded_pointcloud.points_list()[0], points)
+        self.assertClose(reloaded_pointcloud.features_list()[0], features)
+
+        with NamedTemporaryFile(mode='r', suffix='.ply') as f:
+            io.save_pointcloud(data=pointcloud, path=f.name, binary=False)
+            reloaded_pointcloud2 = io.load_pointcloud(f.name)
+            self.assertEqual(f.readline(), 'ply\n')
+            self.assertEqual(f.readline(), 'format ascii 1.0\n')
+        self.assertClose(reloaded_pointcloud2.points_list()[0], points)
+        self.assertClose(reloaded_pointcloud2.features_list()[0], features)
+
+    def test_load_pointcloud_bad_order(self):
+        """
+        Ply file with a strange property order
+        """
+        file = '\n'.join(
+            [
+                'ply',
+                'format ascii 1.0',
+                'element vertex 1',
+                'property uchar green',
+                'property float x',
+                'property float z',
+                'property uchar red',
+                'property float y',
+                'property uchar blue',
+                'end_header',
+                '1 2 3 4 5 6',
+            ]
+        )
+
+        io = IO()
+        pointcloud_gpu = io.load_pointcloud(StringIO(file), device='cuda:0')
+        self.assertEqual(pointcloud_gpu.device, torch.device('cuda:0'))
+        pointcloud = pointcloud_gpu.to(torch.device('cpu'))
+        expected_points = torch.tensor([[[2, 5, 3]]], dtype=torch.float32)
+        expected_features = torch.tensor([[[4, 1, 6]]], dtype=torch.float32)
+        self.assertClose(pointcloud.points_padded(), expected_points)
+        self.assertClose(pointcloud.features_padded(), expected_features)
 
     def test_load_simple_binary(self):
         for big_endian in [True, False]:
@@ -329,10 +583,11 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
             self.assertClose([0, 1, 2, 3], data['face'][0])
             self.assertClose([3, 7, 4, 0], data['face'][5])
 
-            self.assertTupleEqual(data['vertex'].shape, (8, 3))
-            self.assertEqual(len(data['vertex1']), 8)
-            self.assertClose(data['vertex'], data['vertex1'])
-            self.assertClose(data['vertex'].flatten(), list(map(float, verts)))
+            [vertex0] = data['vertex']
+            self.assertTupleEqual(vertex0.shape, (8, 3))
+            self.assertEqual(len(data['vertex1']), 3)
+            self.assertClose(vertex0, np.column_stack(data['vertex1']))
+            self.assertClose(vertex0.flatten(), list(map(float, verts)))
 
             irregular = data['irregular_list']
             self.assertEqual(len(irregular), 3)
@@ -356,7 +611,7 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
             self.assertEqual(mixed[1][0][0], base if big_endian else 256 * base)
 
             self.assertListEqual(
-                data['minus_ones'], [(-1, 255, -1, 65535, -1, 4294967295)]
+                data['minus_ones'], [-1, 255, -1, 65535, -1, 4294967295]
             )
 
     def test_bad_ply_syntax(self):
@@ -461,7 +716,7 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
         lines2.insert(4, 'property double y')
 
         with self.assertRaisesRegex(
-            ValueError, 'Too little data for an element.'
+            ValueError, 'Inconsistent data for vertex.'
         ):
             _load_ply_raw(StringIO('\n'.join(lines2)))
 
@@ -470,15 +725,11 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
 
         lines2[-2] = '3.3 4.3 2'
         with self.assertRaisesRegex(
-            ValueError, 'Too much data for an element.'
+            ValueError, 'Inconsistent data for vertex.'
         ):
             _load_ply_raw(StringIO('\n'.join(lines2)))
 
-        # Now make the ply file actually be readable as a Mesh
-
-        with self.assertRaisesRegex(
-            ValueError, 'The ply file has no face element.'
-        ):
+        with self.assertRaisesRegex(ValueError, 'Invalid vertices in file.'):
             load_ply(StringIO('\n'.join(lines)))
 
         lines2 = lines.copy()
@@ -508,18 +759,28 @@ class TestMeshPlyIO(TestCaseMixin, unittest.TestCase):
         verts: torch.Tensor, faces: torch.Tensor, decimal_places: int
     ):
         return lambda: save_ply(
-            StringIO(), verts, faces, decimal_places=decimal_places
+            BytesIO(),
+            verts=verts,
+            faces=faces,
+            ascii=True,
+            decimal_places=decimal_places,
         )
 
     @staticmethod
     def _bm_load_ply(
         verts: torch.Tensor, faces: torch.Tensor, decimal_places: int
     ):
-        f = StringIO()
-        save_ply(f, verts, faces, decimal_places)
+        f = BytesIO()
+        save_ply(
+            f,
+            verts=verts,
+            faces=faces,
+            ascii=True,
+            decimal_places=decimal_places,
+        )
         s = f.getvalue()
         # Recreate stream so it's unaffected by how it was created.
-        return lambda: load_ply(StringIO(s))
+        return lambda: load_ply(BytesIO(s))
 
     @staticmethod
     def bm_save_simple_ply_with_init(V: int, F: int):

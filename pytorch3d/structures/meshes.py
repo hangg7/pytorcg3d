@@ -5,7 +5,6 @@ from typing import List, Union
 import torch
 
 from . import utils as struct_utils
-from .textures import Textures
 
 
 class Meshes(object):
@@ -62,7 +61,7 @@ class Meshes(object):
         [0.2, 0.3, 0.4],       |       [0.7, 0.3, 0.6],  |
         [0.9, 0.3, 0.8],       |       [0.2, 0.4, 0.8],  |
       ]                        |       [0.9, 0.5, 0.2],  |
-   ])                          |       [0.2, 0.3, 0.4],  |
+    ])                         |       [0.2, 0.3, 0.4],  |
                                |       [0.9, 0.3, 0.8],  |
                                |     ]                   |
                                |  ])                     |
@@ -234,8 +233,8 @@ class Meshes(object):
         Refer to comments above for descriptions of List and Padded representations.
         """
         self.device = None
-        if textures is not None and not isinstance(textures, Textures):
-            msg = 'Expected textures to be of type Textures; got %r'
+        if textures is not None and not hasattr(textures, 'sample_textures'):
+            msg = 'Expected textures to be an instance of type TexturesBase; got %r'
             raise ValueError(msg % type(textures))
         self.textures = textures
 
@@ -329,6 +328,13 @@ class Meshes(object):
             )
             if self._N > 0:
                 self.device = self._verts_list[0].device
+                if not (
+                    all(v.device == self.device for v in verts)
+                    and all(f.device == self.device for f in faces)
+                ):
+                    raise ValueError(
+                        'All Verts and Faces tensors should be on same device.'
+                    )
                 self._num_verts_per_mesh = torch.tensor(
                     [len(v) for v in self._verts_list], device=self.device
                 )
@@ -345,7 +351,6 @@ class Meshes(object):
                     dtype=torch.bool,
                     device=self.device,
                 )
-
                 if (len(self._num_verts_per_mesh.unique()) == 1) and (
                     len(self._num_faces_per_mesh.unique()) == 1
                 ):
@@ -360,6 +365,10 @@ class Meshes(object):
             self._faces_padded = faces.to(torch.int64)
             self._N = self._verts_padded.shape[0]
             self._V = self._verts_padded.shape[1]
+
+            if verts.device != faces.device:
+                msg = 'Verts and Faces tensors should be on same device. \n Got {} and {}.'
+                raise ValueError(msg.format(verts.device, faces.device))
 
             self.device = self._verts_padded.device
             self.valid = torch.zeros(
@@ -411,6 +420,8 @@ class Meshes(object):
             self.textures._num_verts_per_mesh = (
                 self._num_verts_per_mesh.tolist()
             )
+            self.textures._N = self._N
+            self.textures.valid = self.valid
 
     def __len__(self):
         return self._N
@@ -1077,9 +1088,7 @@ class Meshes(object):
         self._edges_packed = torch.stack([u // V, u % V], dim=1)
         self._edges_packed_to_mesh_idx = edge_to_mesh[unique_idx]
 
-        face_to_edge = torch.arange(3 * F).view(3, F).t()
-        face_to_edge = inverse_idxs[face_to_edge]
-        self._faces_packed_to_edges_packed = face_to_edge
+        self._faces_packed_to_edges_packed = inverse_idxs.reshape(3, F).t()
 
         # Compute number of edges per mesh
         num_edges_per_mesh = torch.zeros(
@@ -1182,6 +1191,28 @@ class Meshes(object):
             other.textures = self.textures.clone()
         return other
 
+    def detach(self):
+        """
+        Detach Meshes object. All internal tensors are detached individually.
+
+        Returns:
+            new Meshes object.
+        """
+        verts_list = self.verts_list()
+        faces_list = self.faces_list()
+        new_verts_list = [v.detach() for v in verts_list]
+        new_faces_list = [f.detach() for f in faces_list]
+        other = self.__class__(verts=new_verts_list, faces=new_faces_list)
+        for k in self._INTERNAL_TENSORS:
+            v = getattr(self, k)
+            if torch.is_tensor(v):
+                setattr(other, k, v.detach())
+
+        # Textures is not a tensor but has a detach method
+        if self.textures is not None:
+            other.textures = self.textures.detach()
+        return other
+
     def to(self, device, copy: bool = False):
         """
         Match functionality of torch.Tensor.to()
@@ -1211,7 +1242,7 @@ class Meshes(object):
                 if torch.is_tensor(v):
                     setattr(other, k, v.to(device))
             if self.textures is not None:
-                other.textures = self.textures.to(device)
+                other.textures = other.textures.to(device)
         return other
 
     def cpu(self):
@@ -1269,14 +1300,17 @@ class Meshes(object):
         Add an offset to the vertices of this Meshes. In place operation.
 
         Args:
-            vert_offsets_packed: A Tensor of the same shape as self.verts_packed
-                               giving offsets to be added to all vertices.
+            vert_offsets_packed: A Tensor of shape (3,) or the same shape as
+                                self.verts_packed, giving offsets to be added
+                                to all vertices.
         Returns:
             self.
         """
         verts_packed = self.verts_packed()
+        if vert_offsets_packed.shape == (3,):
+            vert_offsets_packed = vert_offsets_packed.expand_as(verts_packed)
         if vert_offsets_packed.shape != verts_packed.shape:
-            raise ValueError('Verts offsets must have dimension (all_v, 2).')
+            raise ValueError('Verts offsets must have dimension (all_v, 3).')
         # update verts packed
         self._verts_packed = verts_packed + vert_offsets_packed
         new_verts_list = list(
@@ -1373,7 +1407,7 @@ class Meshes(object):
 
     def update_padded(self, new_verts_padded):
         """
-        This function allows for an pdate of verts_padded without having to
+        This function allows for an update of verts_padded without having to
         explicitly convert it to the list representation for heterogeneous batches.
         Returns a Meshes structure with updated padded tensors and copies of the
         auxiliary tensors at construction time.
@@ -1516,14 +1550,29 @@ class Meshes(object):
             verts=new_verts_list, faces=new_faces_list, textures=tex
         )
 
+    def sample_textures(self, fragments):
+        if self.textures is not None:
+            # Pass in faces packed. If the textures are defined per
+            # vertex, the face indices are needed in order to interpolate
+            # the vertex attributes across the face.
+            return self.textures.sample_textures(
+                fragments, faces_packed=self.faces_packed()
+            )
+        else:
+            raise ValueError('Meshes does not have textures')
+
 
 def join_meshes_as_batch(meshes: List[Meshes], include_textures: bool = True):
     """
     Merge multiple Meshes objects, i.e. concatenate the meshes objects. They
     must all be on the same device. If include_textures is true, they must all
     be compatible, either all or none having textures, and all the Textures
-    objects having the same members. If  include_textures is False, textures are
+    objects being the same type. If include_textures is False, textures are
     ignored.
+
+    If the textures are TexturesAtlas then being the same type includes having
+    the same resolution. If they are TexturesUV then it includes having the same
+    align_corners and padding_mode.
 
     Args:
         meshes: list of meshes.
@@ -1536,7 +1585,6 @@ def join_meshes_as_batch(meshes: List[Meshes], include_textures: bool = True):
         # Meshes objects can be iterated and produce single Meshes. We avoid
         # letting join_meshes_as_batch(mesh1, mesh2) silently do the wrong thing.
         raise ValueError('Wrong first argument to join_meshes_as_batch.')
-    # pyre-fixme[10]: Name `mesh` is used but not defined.
     verts = [v for mesh in meshes for v in mesh.verts_list()]
     faces = [f for mesh in meshes for f in mesh.faces_list()]
     if len(meshes) == 0 or not include_textures:
@@ -1551,81 +1599,64 @@ def join_meshes_as_batch(meshes: List[Meshes], include_textures: bool = True):
         raise ValueError('Inconsistent textures in join_meshes_as_batch.')
 
     # Now we know there are multiple meshes and they have textures to merge.
-    first = meshes[0].textures
-    kwargs = {}
-    if first.maps_padded() is not None:
-        if any(mesh.textures.maps_padded() is None for mesh in meshes):
-            raise ValueError(
-                'Inconsistent maps_padded in join_meshes_as_batch.'
-            )
-        maps = [m for mesh in meshes for m in mesh.textures.maps_padded()]
-        kwargs['maps'] = maps
-    elif any(mesh.textures.maps_padded() is not None for mesh in meshes):
-        raise ValueError('Inconsistent maps_padded in join_meshes_as_batch.')
+    all_textures = [mesh.textures for mesh in meshes]
+    first = all_textures[0]
+    tex_types_same = all(type(tex) == type(first) for tex in all_textures)
 
-    if first.verts_uvs_padded() is not None:
-        if any(mesh.textures.verts_uvs_padded() is None for mesh in meshes):
-            raise ValueError(
-                'Inconsistent verts_uvs_padded in join_meshes_as_batch.'
-            )
-        uvs = [uv for mesh in meshes for uv in mesh.textures.verts_uvs_list()]
-        V = max(uv.shape[0] for uv in uvs)
-        kwargs['verts_uvs'] = struct_utils.list_to_padded(uvs, (V, 2), -1)
-    elif any(mesh.textures.verts_uvs_padded() is not None for mesh in meshes):
+    if not tex_types_same:
         raise ValueError(
-            'Inconsistent verts_uvs_padded in join_meshes_as_batch.'
+            'All meshes in the batch must have the same type of texture.'
         )
 
-    if first.faces_uvs_padded() is not None:
-        if any(mesh.textures.faces_uvs_padded() is None for mesh in meshes):
-            raise ValueError(
-                'Inconsistent faces_uvs_padded in join_meshes_as_batch.'
-            )
-        uvs = [uv for mesh in meshes for uv in mesh.textures.faces_uvs_list()]
-        F = max(uv.shape[0] for uv in uvs)
-        kwargs['faces_uvs'] = struct_utils.list_to_padded(uvs, (F, 3), -1)
-    elif any(mesh.textures.faces_uvs_padded() is not None for mesh in meshes):
-        raise ValueError(
-            'Inconsistent faces_uvs_padded in join_meshes_as_batch.'
-        )
-
-    if first.verts_rgb_padded() is not None:
-        if any(mesh.textures.verts_rgb_padded() is None for mesh in meshes):
-            raise ValueError(
-                'Inconsistent verts_rgb_padded in join_meshes_as_batch.'
-            )
-        rgb = [i for mesh in meshes for i in mesh.textures.verts_rgb_list()]
-        V = max(i.shape[0] for i in rgb)
-        kwargs['verts_rgb'] = struct_utils.list_to_padded(rgb, (V, 3))
-    elif any(mesh.textures.verts_rgb_padded() is not None for mesh in meshes):
-        raise ValueError(
-            'Inconsistent verts_rgb_padded in join_meshes_as_batch.'
-        )
-
-    tex = Textures(**kwargs)
+    tex = first.join_batch(all_textures[1:])
     return Meshes(verts=verts, faces=faces, textures=tex)
 
 
-def join_mesh(meshes: Union[Meshes, List[Meshes]]) -> Meshes:
+def join_meshes_as_scene(
+    meshes: Union[Meshes, List[Meshes]], include_textures: bool = True
+) -> Meshes:
     """
     Joins a batch of meshes in the form of a Meshes object or a list of Meshes
-    objects as a single mesh. If the input is a list, the Meshes objects in the list
-    must all be on the same device. This version ignores all textures in the input mehses.
+    objects as a single mesh. If the input is a list, the Meshes objects in the
+    list must all be on the same device. Unless include_textures is False, the
+    meshes must all have the same type of texture or must all not have textures.
+
+    If textures are included, then the textures are joined as a single scene in
+    addition to the meshes. For this, texture types have an appropriate method
+    called join_scene which joins mesh textures into a single texture.
+    If the textures are TexturesAtlas then they must have the same resolution.
+    If they are TexturesUV then they must have the same align_corners and
+    padding_mode. Values in verts_uvs outside [0, 1] will not
+    be respected.
 
     Args:
-        meshes: Meshes object that contains a batch of meshes or a list of Meshes objects
+        meshes: Meshes object that contains a batch of meshes, or a list of
+                    Meshes objects.
+        include_textures: (bool) whether to try to join the textures.
 
     Returns:
         new Meshes object containing a single mesh
     """
+    if not isinstance(include_textures, (bool, int)):
+        # We want to avoid letting join_meshes_as_scene(mesh1, mesh2) silently
+        # do the wrong thing.
+        raise ValueError(
+            f'include_textures argument cannot be {type(include_textures)}'
+        )
     if isinstance(meshes, List):
-        meshes = join_meshes_as_batch(meshes, include_textures=False)
+        meshes = join_meshes_as_batch(meshes, include_textures=include_textures)
 
     if len(meshes) == 1:
         return meshes
     verts = meshes.verts_packed()  # (sum(V_n), 3)
     # Offset automatically done by faces_packed
     faces = meshes.faces_packed()  # (sum(F_n), 3)
+    textures = None
 
-    mesh = Meshes(verts=verts.unsqueeze(0), faces=faces.unsqueeze(0))
+    if include_textures and meshes.textures is not None:
+        textures = meshes.textures.join_scene()
+
+    mesh = Meshes(
+        verts=verts.unsqueeze(0), faces=faces.unsqueeze(0), textures=textures
+    )
     return mesh

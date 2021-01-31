@@ -1,24 +1,22 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
-from .texturing import (
-    interpolate_texture_map,
-    interpolate_vertex_colors,
-)  # isort:skip
 from .rasterize_meshes import rasterize_meshes
 from .rasterizer import MeshRasterizer, RasterizationSettings
 from .renderer import MeshRenderer
+from .shader import TexturedSoftPhongShader  # DEPRECATED
 from .shader import (
+    BlendParams,
     HardFlatShader,
     HardGouraudShader,
     HardPhongShader,
     SoftGouraudShader,
     SoftPhongShader,
     SoftSilhouetteShader,
-    TexturedSoftPhongShader,
 )
 from .shading import gouraud_shading, phong_shading
-from .utils import interpolate_face_attributes
+from .textures import Textures  # DEPRECATED
+from .textures import TexturesAtlas, TexturesUV, TexturesVertex
 
 
 __all__ = [k for k in globals().keys() if not k.startswith('_')]

@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 import torch
 from common_testing import TestCaseMixin
+
 from pytorch3d.renderer.lighting import DirectionalLights, PointLights
 from pytorch3d.transforms import RotateAxisAngle
 
@@ -485,7 +486,7 @@ class TestSpecularLighting(TestCaseMixin, unittest.TestCase):
         top K faces per pixel.
         """
         device = torch.device('cuda:0')
-        N, H, W, K = 16, 256, 256, 100
+        N, H, W, K = 8, 128, 128, 100
         color = torch.tensor([1, 0, 1], dtype=torch.float32, device=device)
         direction = torch.tensor(
             [-1 / np.sqrt(2), 1 / np.sqrt(2), 0], dtype=torch.float32

@@ -8,6 +8,8 @@ from test_chamfer import TestChamfer
 
 
 def bm_chamfer() -> None:
+    # Currently disabled.
+    return
     devices = ['cpu']
     if torch.cuda.is_available():
         devices.append('cuda:0')
@@ -64,3 +66,7 @@ def bm_chamfer() -> None:
             kwargs_list,
             warmup_iters=1,
         )
+
+
+if __name__ == '__main__':
+    bm_chamfer()

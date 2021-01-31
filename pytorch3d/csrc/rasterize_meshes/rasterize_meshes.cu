@@ -90,8 +90,14 @@ __device__ bool CheckPointOutsideBoundingBox(
   const float x_max = xlims.y + blur_radius;
   const float y_max = ylims.y + blur_radius;
 
+  // Faces with at least one vertex behind the camera won't render correctly
+  // and should be removed or clipped before calling the rasterizer
+  const bool z_invalid = zlims.x < kEpsilon;
+
   // Check if the current point is oustside the triangle bounding box.
-  return (pxy.x > x_max || pxy.x < x_min || pxy.y > y_max || pxy.y < y_min);
+  return (
+      pxy.x > x_max || pxy.x < x_min || pxy.y > y_max || pxy.y < y_min ||
+      z_invalid);
 }
 
 // This function checks if a pixel given by xy location pxy lies within the
@@ -114,6 +120,7 @@ __device__ void CheckPixelInsideFace(
     const float2 pxy, // Coordinates of the pixel
     const int K,
     const bool perspective_correct,
+    const bool clip_barycentric_coords,
     const bool cull_backfaces) {
   const auto v012 = GetSingleFaceVerts(face_verts, face_idx);
   const float3 v0 = thrust::get<0>(v012);
@@ -149,8 +156,12 @@ __device__ void CheckPixelInsideFace(
   const float3 p_bary = !perspective_correct
       ? p_bary0
       : BarycentricPerspectiveCorrectionForward(p_bary0, v0.z, v1.z, v2.z);
+  const float3 p_bary_clip =
+      !clip_barycentric_coords ? p_bary : BarycentricClipForward(p_bary);
 
-  const float pz = p_bary.x * v0.z + p_bary.y * v1.z + p_bary.z * v2.z;
+  const float pz =
+      p_bary_clip.x * v0.z + p_bary_clip.y * v1.z + p_bary_clip.z * v2.z;
+
   if (pz < 0) {
     return; // Face is behind the image plane.
   }
@@ -158,7 +169,8 @@ __device__ void CheckPixelInsideFace(
   // Get abs squared distance
   const float dist = PointTriangleDistanceForward(pxy, v0xy, v1xy, v2xy);
 
-  // Use the bary coordinates to determine if the point is inside the face.
+  // Use the unclipped bary coordinates to determine if the point is inside the
+  // face.
   const bool inside = p_bary.x > 0.0f && p_bary.y > 0.0f && p_bary.z > 0.0f;
   const float signed_dist = inside ? -dist : dist;
 
@@ -169,7 +181,7 @@ __device__ void CheckPixelInsideFace(
 
   if (q_size < K) {
     // Just insert it.
-    q[q_size] = {pz, face_idx, signed_dist, p_bary};
+    q[q_size] = {pz, face_idx, signed_dist, p_bary_clip};
     if (pz > q_max_z) {
       q_max_z = pz;
       q_max_idx = q_size;
@@ -177,7 +189,7 @@ __device__ void CheckPixelInsideFace(
     q_size++;
   } else if (pz < q_max_z) {
     // Overwrite the old max, and find the new max.
-    q[q_max_idx] = {pz, face_idx, signed_dist, p_bary};
+    q[q_max_idx] = {pz, face_idx, signed_dist, p_bary_clip};
     q_max_z = pz;
     for (int i = 0; i < K; i++) {
       if (q[i].z > q_max_z) {
@@ -198,6 +210,7 @@ __global__ void RasterizeMeshesNaiveCudaKernel(
     const int64_t* num_faces_per_mesh,
     const float blur_radius,
     const bool perspective_correct,
+    const bool clip_barycentric_coords,
     const bool cull_backfaces,
     const int N,
     const int H,
@@ -221,8 +234,8 @@ __global__ void RasterizeMeshesNaiveCudaKernel(
     const int xi = W - 1 - pix_idx % W;
 
     // screen coordinates to ndc coordiantes of pixel.
-    const float xf = PixToNdc(xi, W);
-    const float yf = PixToNdc(yi, H);
+    const float xf = PixToNonSquareNdc(xi, W, H);
+    const float yf = PixToNonSquareNdc(yi, H, W);
     const float2 pxy = make_float2(xf, yf);
 
     // For keeping track of the K closest points we want a data structure
@@ -249,6 +262,7 @@ __global__ void RasterizeMeshesNaiveCudaKernel(
     for (int f = face_start_idx; f < face_stop_idx; ++f) {
       // Check if the pixel pxy is inside the face bounding box and if it is,
       // update q, q_size, q_max_z and q_max_idx in place.
+
       CheckPixelInsideFace(
           face_verts,
           f,
@@ -260,12 +274,14 @@ __global__ void RasterizeMeshesNaiveCudaKernel(
           pxy,
           K,
           perspective_correct,
+          clip_barycentric_coords,
           cull_backfaces);
     }
 
     // TODO: make sorting an option as only top k is needed, not sorted values.
     BubbleSort(q, q_size);
     int idx = n * H * W * K + pix_idx * K;
+
     for (int k = 0; k < q_size; ++k) {
       face_idxs[idx + k] = q[k].idx;
       zbuf[idx + k] = q[k].z;
@@ -282,10 +298,11 @@ RasterizeMeshesNaiveCuda(
     const at::Tensor& face_verts,
     const at::Tensor& mesh_to_faces_packed_first_idx,
     const at::Tensor& num_faces_per_mesh,
-    const int image_size,
+    const std::tuple<int, int> image_size,
     const float blur_radius,
     const int num_closest,
     const bool perspective_correct,
+    const bool clip_barycentric_coords,
     const bool cull_backfaces) {
   TORCH_CHECK(
       face_verts.ndimension() == 3 && face_verts.size(1) == 3 &&
@@ -317,8 +334,8 @@ RasterizeMeshesNaiveCuda(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   const int N = num_faces_per_mesh.size(0); // batch size.
-  const int H = image_size; // Assume square images.
-  const int W = image_size;
+  const int H = std::get<0>(image_size);
+  const int W = std::get<1>(image_size);
   const int K = num_closest;
 
   auto long_opts = num_faces_per_mesh.options().dtype(at::kLong);
@@ -343,6 +360,7 @@ RasterizeMeshesNaiveCuda(
       num_faces_per_mesh.contiguous().data_ptr<int64_t>(),
       blur_radius,
       perspective_correct,
+      clip_barycentric_coords,
       cull_backfaces,
       N,
       H,
@@ -365,6 +383,7 @@ __global__ void RasterizeMeshesBackwardCudaKernel(
     const float* face_verts, // (F, 3, 3)
     const int64_t* pix_to_face, // (N, H, W, K)
     const bool perspective_correct,
+    const bool clip_barycentric_coords,
     const int N,
     const int H,
     const int W,
@@ -388,8 +407,8 @@ __global__ void RasterizeMeshesBackwardCudaKernel(
     const int yi = H - 1 - pix_idx / W;
     const int xi = W - 1 - pix_idx % W;
 
-    const float xf = PixToNdc(xi, W);
-    const float yf = PixToNdc(yi, H);
+    const float xf = PixToNonSquareNdc(xi, W, H);
+    const float yf = PixToNonSquareNdc(yi, H, W);
     const float2 pxy = make_float2(xf, yf);
 
     // Loop over all the faces for this pixel.
@@ -422,14 +441,17 @@ __global__ void RasterizeMeshesBackwardCudaKernel(
       const float3 grad_bary_upstream = make_float3(
           grad_bary_upstream_w0, grad_bary_upstream_w1, grad_bary_upstream_w2);
 
-      const float3 bary0 = BarycentricCoordsForward(pxy, v0xy, v1xy, v2xy);
-      const float3 bary = !perspective_correct
-          ? bary0
-          : BarycentricPerspectiveCorrectionForward(bary0, v0.z, v1.z, v2.z);
-      const bool inside = bary.x > 0.0f && bary.y > 0.0f && bary.z > 0.0f;
+      const float3 b_w = BarycentricCoordsForward(pxy, v0xy, v1xy, v2xy);
+      const float3 b_pp = !perspective_correct
+          ? b_w
+          : BarycentricPerspectiveCorrectionForward(b_w, v0.z, v1.z, v2.z);
+
+      const float3 b_w_clip =
+          !clip_barycentric_coords ? b_pp : BarycentricClipForward(b_pp);
+
+      const bool inside = b_pp.x > 0.0f && b_pp.y > 0.0f && b_pp.z > 0.0f;
       const float sign = inside ? -1.0f : 1.0f;
 
-      // TODO(T52813608) Add support for non-square images.
       auto grad_dist_f = PointTriangleDistanceBackward(
           pxy, v0xy, v1xy, v2xy, sign * grad_dist_upstream);
       const float2 ddist_d_v0 = thrust::get<1>(grad_dist_f);
@@ -442,22 +464,29 @@ __global__ void RasterizeMeshesBackwardCudaKernel(
       // d_zbuf/d_bary_w0 = z0
       // d_zbuf/d_bary_w1 = z1
       // d_zbuf/d_bary_w2 = z2
-      const float3 d_zbuf_d_bary = make_float3(v0.z, v1.z, v2.z);
+      const float3 d_zbuf_d_bwclip = make_float3(v0.z, v1.z, v2.z);
 
       // Total upstream barycentric gradients are the sum of
       // external upstream gradients and contribution from zbuf.
       const float3 grad_bary_f_sum =
-          (grad_bary_upstream + grad_zbuf_upstream * d_zbuf_d_bary);
+          (grad_bary_upstream + grad_zbuf_upstream * d_zbuf_d_bwclip);
+
       float3 grad_bary0 = grad_bary_f_sum;
+
+      if (clip_barycentric_coords) {
+        grad_bary0 = BarycentricClipBackward(b_w, grad_bary_f_sum);
+      }
+
       float dz0_persp = 0.0f, dz1_persp = 0.0f, dz2_persp = 0.0f;
       if (perspective_correct) {
         auto perspective_grads = BarycentricPerspectiveCorrectionBackward(
-            bary0, v0.z, v1.z, v2.z, grad_bary_f_sum);
+            b_w, v0.z, v1.z, v2.z, grad_bary0);
         grad_bary0 = thrust::get<0>(perspective_grads);
         dz0_persp = thrust::get<1>(perspective_grads);
         dz1_persp = thrust::get<2>(perspective_grads);
         dz2_persp = thrust::get<3>(perspective_grads);
       }
+
       auto grad_bary_f =
           BarycentricCoordsBackward(pxy, v0xy, v1xy, v2xy, grad_bary0);
       const float2 dbary_d_v0 = thrust::get<1>(grad_bary_f);
@@ -467,15 +496,18 @@ __global__ void RasterizeMeshesBackwardCudaKernel(
       atomicAdd(grad_face_verts + f * 9 + 0, dbary_d_v0.x + ddist_d_v0.x);
       atomicAdd(grad_face_verts + f * 9 + 1, dbary_d_v0.y + ddist_d_v0.y);
       atomicAdd(
-          grad_face_verts + f * 9 + 2, grad_zbuf_upstream * bary.x + dz0_persp);
+          grad_face_verts + f * 9 + 2,
+          grad_zbuf_upstream * b_w_clip.x + dz0_persp);
       atomicAdd(grad_face_verts + f * 9 + 3, dbary_d_v1.x + ddist_d_v1.x);
       atomicAdd(grad_face_verts + f * 9 + 4, dbary_d_v1.y + ddist_d_v1.y);
       atomicAdd(
-          grad_face_verts + f * 9 + 5, grad_zbuf_upstream * bary.y + dz1_persp);
+          grad_face_verts + f * 9 + 5,
+          grad_zbuf_upstream * b_w_clip.y + dz1_persp);
       atomicAdd(grad_face_verts + f * 9 + 6, dbary_d_v2.x + ddist_d_v2.x);
       atomicAdd(grad_face_verts + f * 9 + 7, dbary_d_v2.y + ddist_d_v2.y);
       atomicAdd(
-          grad_face_verts + f * 9 + 8, grad_zbuf_upstream * bary.z + dz2_persp);
+          grad_face_verts + f * 9 + 8,
+          grad_zbuf_upstream * b_w_clip.z + dz2_persp);
     }
   }
 }
@@ -486,7 +518,8 @@ at::Tensor RasterizeMeshesBackwardCuda(
     const at::Tensor& grad_zbuf, // (N, H, W, K)
     const at::Tensor& grad_bary, // (N, H, W, K, 3)
     const at::Tensor& grad_dists, // (N, H, W, K)
-    const bool perspective_correct) {
+    const bool perspective_correct,
+    const bool clip_barycentric_coords) {
   // Check inputs are on the same device
   at::TensorArg face_verts_t{face_verts, "face_verts", 1},
       pix_to_face_t{pix_to_face, "pix_to_face", 2},
@@ -523,6 +556,7 @@ at::Tensor RasterizeMeshesBackwardCuda(
       face_verts.contiguous().data_ptr<float>(),
       pix_to_face.contiguous().data_ptr<int64_t>(),
       perspective_correct,
+      clip_barycentric_coords,
       N,
       H,
       W,
@@ -556,12 +590,25 @@ __global__ void RasterizeMeshesCoarseCudaKernel(
     int* bin_faces) {
   extern __shared__ char sbuf[];
   const int M = max_faces_per_bin;
-  const int num_bins = 1 + (W - 1) / bin_size; // Integer divide round up
-  const float half_pix = 1.0f / W; // Size of half a pixel in NDC units
-  // This is a boolean array of shape (num_bins, num_bins, chunk_size)
+  // Integer divide round up
+  const int num_bins_x = 1 + (W - 1) / bin_size;
+  const int num_bins_y = 1 + (H - 1) / bin_size;
+
+  // NDC range depends on the ratio of W/H
+  // The shorter side from (H, W) is given an NDC range of 2.0 and
+  // the other side is scaled by the ratio of H:W.
+  const float NDC_x_half_range = NonSquareNdcRange(W, H) / 2.0f;
+  const float NDC_y_half_range = NonSquareNdcRange(H, W) / 2.0f;
+
+  // Size of half a pixel in NDC units is the NDC half range
+  // divided by the corresponding image dimension
+  const float half_pix_x = NDC_x_half_range / W;
+  const float half_pix_y = NDC_y_half_range / H;
+
+  // This is a boolean array of shape (num_bins_y, num_bins_x, chunk_size)
   // stored in shared memory that will track whether each point in the chunk
   // falls into each bin of the image.
-  BitMask binmask((unsigned int*)sbuf, num_bins, num_bins, chunk_size);
+  BitMask binmask((unsigned int*)sbuf, num_bins_y, num_bins_x, chunk_size);
 
   // Have each block handle a chunk of faces
   const int chunks_per_batch = 1 + (F - 1) / chunk_size;
@@ -598,28 +645,34 @@ __global__ void RasterizeMeshesCoarseCudaKernel(
       float ymin = FloatMin3(v0.y, v1.y, v2.y) - sqrt(blur_radius);
       float xmax = FloatMax3(v0.x, v1.x, v2.x) + sqrt(blur_radius);
       float ymax = FloatMax3(v0.y, v1.y, v2.y) + sqrt(blur_radius);
-      float zmax = FloatMax3(v0.z, v1.z, v2.z);
+      float zmin = FloatMin3(v0.z, v1.z, v2.z);
 
-      if (zmax < 0) {
-        continue; // Face is behind the camera.
+      // Faces with at least one vertex behind the camera won't render
+      // correctly and should be removed or clipped before calling the
+      // rasterizer
+      if (zmin < kEpsilon) {
+        continue;
       }
 
       // Brute-force search over all bins; TODO(T54294966) something smarter.
-      for (int by = 0; by < num_bins; ++by) {
+      for (int by = 0; by < num_bins_y; ++by) {
         // Y coordinate of the top and bottom of the bin.
         // PixToNdc gives the location of the center of each pixel, so we
         // need to add/subtract a half pixel to get the true extent of the bin.
         // Reverse ordering of Y axis so that +Y is upwards in the image.
-        const float bin_y_min = PixToNdc(by * bin_size, H) - half_pix;
-        const float bin_y_max = PixToNdc((by + 1) * bin_size - 1, H) + half_pix;
+        const float bin_y_min =
+            PixToNonSquareNdc(by * bin_size, H, W) - half_pix_y;
+        const float bin_y_max =
+            PixToNonSquareNdc((by + 1) * bin_size - 1, H, W) + half_pix_y;
         const bool y_overlap = (ymin <= bin_y_max) && (bin_y_min < ymax);
 
-        for (int bx = 0; bx < num_bins; ++bx) {
+        for (int bx = 0; bx < num_bins_x; ++bx) {
           // X coordinate of the left and right of the bin.
           // Reverse ordering of x axis so that +X is left.
           const float bin_x_max =
-              PixToNdc((bx + 1) * bin_size - 1, W) + half_pix;
-          const float bin_x_min = PixToNdc(bx * bin_size, W) - half_pix;
+              PixToNonSquareNdc((bx + 1) * bin_size - 1, W, H) + half_pix_x;
+          const float bin_x_min =
+              PixToNonSquareNdc(bx * bin_size, W, H) - half_pix_x;
 
           const bool x_overlap = (xmin <= bin_x_max) && (bin_x_min < xmax);
           if (y_overlap && x_overlap) {
@@ -632,12 +685,13 @@ __global__ void RasterizeMeshesCoarseCudaKernel(
     // Now we have processed every face in the current chunk. We need to
     // count the number of faces in each bin so we can write the indices
     // out to global memory. We have each thread handle a different bin.
-    for (int byx = threadIdx.x; byx < num_bins * num_bins; byx += blockDim.x) {
-      const int by = byx / num_bins;
-      const int bx = byx % num_bins;
+    for (int byx = threadIdx.x; byx < num_bins_y * num_bins_x;
+         byx += blockDim.x) {
+      const int by = byx / num_bins_x;
+      const int bx = byx % num_bins_x;
       const int count = binmask.count(by, bx);
       const int faces_per_bin_idx =
-          batch_idx * num_bins * num_bins + by * num_bins + bx;
+          batch_idx * num_bins_y * num_bins_x + by * num_bins_x + bx;
 
       // This atomically increments the (global) number of faces found
       // in the current bin, and gets the previous value of the counter;
@@ -647,8 +701,8 @@ __global__ void RasterizeMeshesCoarseCudaKernel(
 
       // Now loop over the binmask and write the active bits for this bin
       // out to bin_faces.
-      int next_idx = batch_idx * num_bins * num_bins * M + by * num_bins * M +
-          bx * M + start;
+      int next_idx = batch_idx * num_bins_y * num_bins_x * M +
+          by * num_bins_x * M + bx * M + start;
       for (int f = 0; f < chunk_size; ++f) {
         if (binmask.get(by, bx, f)) {
           // TODO(T54296346) find the correct method for handling errors in
@@ -667,7 +721,7 @@ at::Tensor RasterizeMeshesCoarseCuda(
     const at::Tensor& face_verts,
     const at::Tensor& mesh_to_face_first_idx,
     const at::Tensor& num_faces_per_mesh,
-    const int image_size,
+    const std::tuple<int, int> image_size,
     const float blur_radius,
     const int bin_size,
     const int max_faces_per_bin) {
@@ -689,21 +743,27 @@ at::Tensor RasterizeMeshesCoarseCuda(
   at::cuda::CUDAGuard device_guard(face_verts.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  const int W = image_size;
-  const int H = image_size;
+  const int H = std::get<0>(image_size);
+  const int W = std::get<1>(image_size);
+
   const int F = face_verts.size(0);
   const int N = num_faces_per_mesh.size(0);
-  const int num_bins = 1 + (image_size - 1) / bin_size; // Divide round up.
   const int M = max_faces_per_bin;
 
-  if (num_bins >= kMaxFacesPerBin) {
+  // Integer divide round up.
+  const int num_bins_y = 1 + (H - 1) / bin_size;
+  const int num_bins_x = 1 + (W - 1) / bin_size;
+
+  if (num_bins_y >= kMaxItemsPerBin || num_bins_x >= kMaxItemsPerBin) {
     std::stringstream ss;
-    ss << "Got " << num_bins << "; that's too many!";
+    ss << "In Coarse Rasterizer got num_bins_y: " << num_bins_y
+       << ", num_bins_x: " << num_bins_x << ", "
+       << "; that's too many!";
     AT_ERROR(ss.str());
   }
   auto opts = num_faces_per_mesh.options().dtype(at::kInt);
-  at::Tensor faces_per_bin = at::zeros({N, num_bins, num_bins}, opts);
-  at::Tensor bin_faces = at::full({N, num_bins, num_bins, M}, -1, opts);
+  at::Tensor faces_per_bin = at::zeros({N, num_bins_y, num_bins_x}, opts);
+  at::Tensor bin_faces = at::full({N, num_bins_y, num_bins_x, M}, -1, opts);
 
   if (bin_faces.numel() == 0) {
     AT_CUDA_CHECK(cudaGetLastError());
@@ -711,7 +771,7 @@ at::Tensor RasterizeMeshesCoarseCuda(
   }
 
   const int chunk_size = 512;
-  const size_t shared_size = num_bins * num_bins * chunk_size / 8;
+  const size_t shared_size = num_bins_y * num_bins_x * chunk_size / 8;
   const size_t blocks = 64;
   const size_t threads = 512;
 
@@ -739,24 +799,26 @@ at::Tensor RasterizeMeshesCoarseCuda(
 // ****************************************************************************
 __global__ void RasterizeMeshesFineCudaKernel(
     const float* face_verts, // (F, 3, 3)
-    const int32_t* bin_faces, // (N, B, B, T)
+    const int32_t* bin_faces, // (N, BH, BW, T)
     const float blur_radius,
     const int bin_size,
     const bool perspective_correct,
+    const bool clip_barycentric_coords,
     const bool cull_backfaces,
     const int N,
-    const int B,
+    const int BH,
+    const int BW,
     const int M,
     const int H,
     const int W,
     const int K,
-    int64_t* face_idxs, // (N, S, S, K)
-    float* zbuf, // (N, S, S, K)
-    float* pix_dists, // (N, S, S, K)
-    float* bary // (N, S, S, K, 3)
+    int64_t* face_idxs, // (N, H, W, K)
+    float* zbuf, // (N, H, W, K)
+    float* pix_dists, // (N, H, W, K)
+    float* bary // (N, H, W, K, 3)
 ) {
-  // This can be more than S^2 if S % bin_size != 0
-  int num_pixels = N * B * B * bin_size * bin_size;
+  // This can be more than H * W if H or W are not divisible by bin_size.
+  int num_pixels = N * BH * BW * bin_size * bin_size;
   int num_threads = gridDim.x * blockDim.x;
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -766,20 +828,26 @@ __global__ void RasterizeMeshesFineCudaKernel(
     // into the same bin; this should give them coalesced memory reads when
     // they read from faces and bin_faces.
     int i = pid;
-    const int n = i / (B * B * bin_size * bin_size);
-    i %= B * B * bin_size * bin_size;
-    const int by = i / (B * bin_size * bin_size);
-    i %= B * bin_size * bin_size;
+    const int n = i / (BH * BW * bin_size * bin_size);
+    i %= BH * BW * bin_size * bin_size;
+    // bin index y
+    const int by = i / (BW * bin_size * bin_size);
+    i %= BW * bin_size * bin_size;
+    // bin index y
     const int bx = i / (bin_size * bin_size);
+    // pixel within the bin
     i %= bin_size * bin_size;
+
+    // Pixel x, y indices
     const int yi = i / bin_size + by * bin_size;
     const int xi = i % bin_size + bx * bin_size;
 
     if (yi >= H || xi >= W)
       continue;
 
-    const float xf = PixToNdc(xi, W);
-    const float yf = PixToNdc(yi, H);
+    const float xf = PixToNonSquareNdc(xi, W, H);
+    const float yf = PixToNonSquareNdc(yi, H, W);
+
     const float2 pxy = make_float2(xf, yf);
 
     // This part looks like the naive rasterization kernel, except we use
@@ -791,7 +859,7 @@ __global__ void RasterizeMeshesFineCudaKernel(
     float q_max_z = -1000;
     int q_max_idx = -1;
     for (int m = 0; m < M; m++) {
-      const int f = bin_faces[n * B * B * M + by * B * M + bx * M + m];
+      const int f = bin_faces[n * BH * BW * M + by * BW * M + bx * M + m];
       if (f < 0) {
         continue; // bin_faces uses -1 as a sentinal value.
       }
@@ -808,6 +876,7 @@ __global__ void RasterizeMeshesFineCudaKernel(
           pxy,
           K,
           perspective_correct,
+          clip_barycentric_coords,
           cull_backfaces);
     }
 
@@ -820,7 +889,8 @@ __global__ void RasterizeMeshesFineCudaKernel(
     // in the image +Y is pointing up and +X is pointing left.
     const int yidx = H - 1 - yi;
     const int xidx = W - 1 - xi;
-    const int pix_idx = n * H * W * K + yidx * H * K + xidx * K;
+
+    const int pix_idx = n * H * W * K + yidx * W * K + xidx * K;
     for (int k = 0; k < q_size; k++) {
       face_idxs[pix_idx + k] = q[k].idx;
       zbuf[pix_idx + k] = q[k].z;
@@ -836,11 +906,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 RasterizeMeshesFineCuda(
     const at::Tensor& face_verts,
     const at::Tensor& bin_faces,
-    const int image_size,
+    const std::tuple<int, int> image_size,
     const float blur_radius,
     const int bin_size,
     const int faces_per_pixel,
     const bool perspective_correct,
+    const bool clip_barycentric_coords,
     const bool cull_backfaces) {
   TORCH_CHECK(
       face_verts.ndimension() == 3 && face_verts.size(1) == 3 &&
@@ -858,12 +929,15 @@ RasterizeMeshesFineCuda(
   at::cuda::CUDAGuard device_guard(face_verts.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  // bin_faces shape (N, BH, BW, M)
   const int N = bin_faces.size(0);
-  const int B = bin_faces.size(1);
+  const int BH = bin_faces.size(1);
+  const int BW = bin_faces.size(2);
   const int M = bin_faces.size(3);
   const int K = faces_per_pixel;
-  const int H = image_size; // Assume square images only.
-  const int W = image_size;
+
+  const int H = std::get<0>(image_size);
+  const int W = std::get<1>(image_size);
 
   if (K > kMaxPointsPerPixel) {
     AT_ERROR("Must have num_closest <= 150");
@@ -890,9 +964,11 @@ RasterizeMeshesFineCuda(
       blur_radius,
       bin_size,
       perspective_correct,
+      clip_barycentric_coords,
       cull_backfaces,
       N,
-      B,
+      BH,
+      BW,
       M,
       H,
       W,

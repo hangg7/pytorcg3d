@@ -4,6 +4,7 @@ from itertools import product
 
 import torch
 from fvcore.common.benchmark import benchmark
+
 from pytorch3d.renderer.lighting import diffuse, specular
 
 
@@ -49,3 +50,7 @@ def bm_lighting() -> None:
     benchmark(
         _bm_specular_cuda_with_init, 'SPECULAR', kwargs_list, warmup_iters=3
     )
+
+
+if __name__ == '__main__':
+    bm_lighting()

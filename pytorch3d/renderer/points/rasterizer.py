@@ -2,12 +2,11 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-from ..cameras import get_world_to_view_transform
 from .rasterize_points import rasterize_points
 
 
@@ -30,8 +29,8 @@ class PointsRasterizationSettings:
 
     def __init__(
         self,
-        image_size: int = 256,
-        radius: float = 0.01,
+        image_size: Union[int, Tuple[int, int]] = 256,
+        radius: Union[float, torch.Tensor] = 0.01,
         points_per_pixel: int = 8,
         bin_size: Optional[int] = None,
         max_points_per_bin: Optional[int] = None,
@@ -86,23 +85,24 @@ class PointsRasterizer(nn.Module):
             raise ValueError(msg)
 
         pts_world = point_clouds.points_padded()
-        pts_world_packed = point_clouds.points_packed()
-        pts_screen = cameras.transform_points(pts_world, **kwargs)
-
         # NOTE: Retaining view space z coordinate for now.
         # TODO: Remove this line when the convention for the z coordinate in
         # the rasterizer is decided. i.e. retain z in view space or transform
         # to a different range.
-        view_transform = get_world_to_view_transform(R=cameras.R, T=cameras.T)
-        verts_view = view_transform.transform_points(pts_world)
-        pts_screen[..., 2] = verts_view[..., 2]
-
-        # Offset points of input pointcloud to reuse cached padded/packed calculations.
-        pad_to_packed_idx = point_clouds.padded_to_packed_idx()
-        pts_screen_packed = pts_screen.view(-1, 3)[pad_to_packed_idx, :]
-        pts_packed_offset = pts_screen_packed - pts_world_packed
-        point_clouds = point_clouds.offset(pts_packed_offset)
+        pts_view = cameras.get_world_to_view_transform(
+            **kwargs
+        ).transform_points(pts_world)
+        pts_screen = cameras.get_projection_transform(
+            **kwargs
+        ).transform_points(pts_view)
+        pts_screen[..., 2] = pts_view[..., 2]
+        point_clouds = point_clouds.update_padded(pts_screen)
         return point_clouds
+
+    def to(self, device):
+        # Manually move to device cameras as it is not a subclass of nn.Module
+        self.cameras = self.cameras.to(device)
+        return self
 
     def forward(self, point_clouds, **kwargs) -> PointFragments:
         """

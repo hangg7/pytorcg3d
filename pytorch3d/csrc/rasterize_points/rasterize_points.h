@@ -14,8 +14,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> RasterizePointsNaiveCpu(
     const torch::Tensor& points,
     const torch::Tensor& cloud_to_packed_first_idx,
     const torch::Tensor& num_points_per_cloud,
-    const int image_size,
-    const float radius,
+    const std::tuple<int, int> image_size,
+    const torch::Tensor& radius,
     const int points_per_pixel);
 
 #ifdef WITH_CUDA
@@ -24,8 +24,8 @@ RasterizePointsNaiveCuda(
     const torch::Tensor& points,
     const torch::Tensor& cloud_to_packed_first_idx,
     const torch::Tensor& num_points_per_cloud,
-    const int image_size,
-    const float radius,
+    const std::tuple<int, int> image_size,
+    const torch::Tensor& radius,
     const int points_per_pixel);
 #endif
 // Naive (forward) pointcloud rasterization: For each pixel, for each point,
@@ -41,8 +41,10 @@ RasterizePointsNaiveCuda(
 //                          in the batch where N is the batch size.
 //  num_points_per_cloud: LongTensor of shape (N) giving the number of points
 //                        for each pointcloud in the batch.
-//  radius: Radius of each point (in NDC units)
-//  image_size: (S) Size of the image to return (in pixels)
+//  radius: FloatTensor of shape (P) giving the radius (in NDC units) of
+//          each point in points.
+//  image_size: Tuple (H, W) giving the size in pixels of the output
+//              image to be rasterized.
 //  points_per_pixel: (K) The number closest of points to return for each pixel
 //
 // Returns:
@@ -61,8 +63,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> RasterizePointsNaive(
     const torch::Tensor& points,
     const torch::Tensor& cloud_to_packed_first_idx,
     const torch::Tensor& num_points_per_cloud,
-    const int image_size,
-    const float radius,
+    const std::tuple<int, int> image_size,
+    const torch::Tensor& radius,
     const int points_per_pixel) {
   if (points.is_cuda() && cloud_to_packed_first_idx.is_cuda() &&
       num_points_per_cloud.is_cuda()) {
@@ -70,6 +72,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> RasterizePointsNaive(
     CHECK_CUDA(points);
     CHECK_CUDA(cloud_to_packed_first_idx);
     CHECK_CUDA(num_points_per_cloud);
+    CHECK_CUDA(radius);
     return RasterizePointsNaiveCuda(
         points,
         cloud_to_packed_first_idx,
@@ -99,8 +102,8 @@ torch::Tensor RasterizePointsCoarseCpu(
     const torch::Tensor& points,
     const torch::Tensor& cloud_to_packed_first_idx,
     const torch::Tensor& num_points_per_cloud,
-    const int image_size,
-    const float radius,
+    const std::tuple<int, int> image_size,
+    const torch::Tensor& radius,
     const int bin_size,
     const int max_points_per_bin);
 
@@ -109,8 +112,8 @@ torch::Tensor RasterizePointsCoarseCuda(
     const torch::Tensor& points,
     const torch::Tensor& cloud_to_packed_first_idx,
     const torch::Tensor& num_points_per_cloud,
-    const int image_size,
-    const float radius,
+    const std::tuple<int, int> image_size,
+    const torch::Tensor& radius,
     const int bin_size,
     const int max_points_per_bin);
 #endif
@@ -124,8 +127,10 @@ torch::Tensor RasterizePointsCoarseCuda(
 //                          in the batch where N is the batch size.
 //  num_points_per_cloud: LongTensor of shape (N) giving the number of points
 //                        for each pointcloud in the batch.
-//  radius: Radius of points to rasterize (in NDC units)
-//  image_size: Size of the image to generate (in pixels)
+//  radius: FloatTensor of shape (P) giving the radius (in NDC units) of
+//          each point in points.
+//  image_size: Tuple (H, W) giving the size in pixels of the output
+//              image to be rasterized.
 //  bin_size: Size of each bin within the image (in pixels)
 //
 // Returns:
@@ -137,8 +142,8 @@ torch::Tensor RasterizePointsCoarse(
     const torch::Tensor& points,
     const torch::Tensor& cloud_to_packed_first_idx,
     const torch::Tensor& num_points_per_cloud,
-    const int image_size,
-    const float radius,
+    const std::tuple<int, int> image_size,
+    const torch::Tensor& radius,
     const int bin_size,
     const int max_points_per_bin) {
   if (points.is_cuda() && cloud_to_packed_first_idx.is_cuda() &&
@@ -147,6 +152,7 @@ torch::Tensor RasterizePointsCoarse(
     CHECK_CUDA(points);
     CHECK_CUDA(cloud_to_packed_first_idx);
     CHECK_CUDA(num_points_per_cloud);
+    CHECK_CUDA(radius);
     return RasterizePointsCoarseCuda(
         points,
         cloud_to_packed_first_idx,
@@ -178,8 +184,8 @@ torch::Tensor RasterizePointsCoarse(
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> RasterizePointsFineCuda(
     const torch::Tensor& points,
     const torch::Tensor& bin_points,
-    const int image_size,
-    const float radius,
+    const std::tuple<int, int> image_size,
+    const torch::Tensor& radius,
     const int bin_size,
     const int points_per_pixel);
 #endif
@@ -190,8 +196,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> RasterizePointsFineCuda(
 //          are expected to be in NDC coordinates in the range [-1, 1].
 //  bin_points: int32 Tensor of shape (N, B, B, M) giving the indices of points
 //              that fall into each bin (output from coarse rasterization)
-//  image_size: Size of image to generate (in pixels)
-//  radius: Radius of points to rasterize (NDC units)
+//  image_size: Tuple (H, W) giving the size in pixels of the output
+//              image to be rasterized.
+//  radius: FloatTensor of shape (P) giving the radius (in NDC units) of
+//          each point in points.
 //  bin_size: Size of each bin (in pixels)
 //  points_per_pixel: How many points to rasterize for each pixel
 //
@@ -209,8 +217,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> RasterizePointsFineCuda(
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> RasterizePointsFine(
     const torch::Tensor& points,
     const torch::Tensor& bin_points,
-    const int image_size,
-    const float radius,
+    const std::tuple<int, int> image_size,
+    const torch::Tensor& radius,
     const int bin_size,
     const int points_per_pixel) {
   if (points.is_cuda()) {
@@ -296,8 +304,10 @@ torch::Tensor RasterizePointsBackward(
 //                          in the batch where N is the batch size.
 //  num_points_per_cloud: LongTensor of shape (N) giving the number of points
 //                        for each pointcloud in the batch.
-//  radius: Radius of each point (in NDC units)
-//  image_size:  (S) Size of the image to return (in pixels)
+//  radius: FloatTensor of shape (P) giving the radius (in NDC units) of
+//          each point in points.
+//  image_size: Tuple (H, W) giving the size in pixels of the output
+//              image to be rasterized.
 //  points_per_pixel: (K) The number of points to return for each pixel
 //  bin_size: Bin size (in pixels) for coarse-to-fine rasterization. Setting
 //            bin_size=0 uses naive rasterization instead.
@@ -319,8 +329,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> RasterizePoints(
     const torch::Tensor& points,
     const torch::Tensor& cloud_to_packed_first_idx,
     const torch::Tensor& num_points_per_cloud,
-    const int image_size,
-    const float radius,
+    const std::tuple<int, int> image_size,
+    const torch::Tensor& radius,
     const int points_per_pixel,
     const int bin_size,
     const int max_points_per_bin) {
